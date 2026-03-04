@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---------- UI ----------
 if command -v tput >/dev/null 2>&1; then
   C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
   C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
-  C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"; C_WHITE="$(tput setaf 7)"
+  C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"
 else
   C_RESET=""; C_BOLD=""; C_DIM=""
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_MAGENTA=""; C_CYAN=""
 fi
 
 cls(){ printf "\033c"; }
-pause(){ printf "\n%sPress Enter...%s" "$C_DIM" "$C_RESET"; IFS= read -r _; }
+pause(){ printf "\n%sPress Enter...%s" "$C_DIM" "$C_RESET"; IFS= read -r _ || true; }
 trim(){ printf "%s" "$1" | sed 's/\r//g' | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
 lower(){ printf "%s" "$1" | tr 'A-Z' 'a-z'; }
 need(){ command -v "$1" >/dev/null 2>&1; }
@@ -43,20 +44,26 @@ banner(){
 EOF
 }
 
-OUT="out"
+# ---------- State ----------
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+OUT="${OUT:-$ROOT_DIR/out}"
 RUN=""
 STATE=""
 DONE=""
 EVID=""
+LOGS=""
 TARGETS=""
-AUTH_PHRASE="I_HAVE_AUTHORIZATION"
+CONF=""
+REPORT=""
+AUTH_FILE=""
 
 WORDLIST=""
 RATE="10"
 THREADS="50"
 DEPTH="3"
-NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
-SEVERITY="low,medium,high,critical"
+
+AUTH_GATE_TEXT="This tool is for authorized security testing only.
+Do you understand and agree to use it ethically and only with explicit permission?"
 
 init_run(){
   mkdir -p "$OUT/run"
@@ -64,11 +71,87 @@ init_run(){
   STATE="$RUN/state"
   DONE="$STATE/done"
   EVID="$RUN/evidence"
-  mkdir -p "$STATE" "$DONE" "$EVID"
+  LOGS="$RUN/logs"
+  mkdir -p "$STATE" "$DONE" "$EVID" "$LOGS"
   TARGETS="$RUN/targets.txt"
+  CONF="$RUN/modules.conf"
+  REPORT="$RUN/REPORT.md"
+  AUTH_FILE="$RUN/AUTHORIZATION.txt"
   touch "$TARGETS"
+  ensure_conf
 }
 
+# ---------- Modules (IDs + descriptions) ----------
+# You configure their commands in modules.conf
+MODULE_IDS=(recon urls crawl params ffuf nuclei nmap report)
+MODULE_TITLES=(
+  "Recon"
+  "URL Discovery"
+  "Crawl"
+  "Params"
+  "ffuf"
+  "Nuclei"
+  "nmap"
+  "Report"
+)
+MODULE_DESCS=(
+  "Run your recon chain (subdomains/probe/etc.)."
+  "Collect URLs (gau/wayback/etc.)."
+  "Crawl targets (katana/etc.)."
+  "Extract params, build candidate lists."
+  "Run your fuzzing module."
+  "Run your templates module."
+  "Run your port scan module."
+  "Build/update REPORT.md from evidence/logs."
+)
+
+# Selection state
+SEL_recon=0
+SEL_urls=0
+SEL_crawl=0
+SEL_params=0
+SEL_ffuf=0
+SEL_nuclei=0
+SEL_nmap=0
+SEL_report=0
+
+reset_selection(){
+  SEL_recon=0; SEL_urls=0; SEL_crawl=0; SEL_params=0
+  SEL_ffuf=0; SEL_nuclei=0; SEL_nmap=0; SEL_report=0
+}
+toggle(){
+  local name="$1"
+  local v="${!name}"
+  if [[ "$v" -eq 1 ]]; then
+    printf -v "$name" "0"
+  else
+    printf -v "$name" "1"
+  fi
+}
+sel_mark(){
+  local v="$1"
+  if [[ "$v" -eq 1 ]]; then
+    printf "%s[x]%s" "$C_GREEN" "$C_RESET"
+  else
+    printf "%s[ ]%s" "$C_DIM" "$C_RESET"
+  fi
+}
+sel_summary(){
+  local s=""
+  [[ "$SEL_recon" -eq 1 ]] && s="$s recon"
+  [[ "$SEL_urls" -eq 1 ]] && s="$s urls"
+  [[ "$SEL_crawl" -eq 1 ]] && s="$s crawl"
+  [[ "$SEL_params" -eq 1 ]] && s="$s params"
+  [[ "$SEL_ffuf" -eq 1 ]] && s="$s ffuf"
+  [[ "$SEL_nuclei" -eq 1 ]] && s="$s nuclei"
+  [[ "$SEL_nmap" -eq 1 ]] && s="$s nmap"
+  [[ "$SEL_report" -eq 1 ]] && s="$s report"
+  s="$(trim "$s")"
+  [[ -z "$s" ]] && s="<none>"
+  printf "%s" "$s"
+}
+
+# ---------- Targets ----------
 normalize_target(){
   local x
   x="$(trim "$1")"
@@ -76,9 +159,7 @@ normalize_target(){
   x="$(lower "$x")"
   printf "%s" "$x"
 }
-
 targets_count(){ grep -c "." "$TARGETS" 2>/dev/null || echo 0; }
-
 show_targets(){
   echo
   if [[ -s "$TARGETS" ]]; then
@@ -87,7 +168,6 @@ show_targets(){
     echo "No targets saved."
   fi
 }
-
 targets_add(){
   echo
   echo "${C_DIM}Paste targets one per line. Blank line = finish. done = finish. b = back.${C_RESET}"
@@ -114,20 +194,18 @@ targets_add(){
   echo
   pause
 }
-
 targets_clear(){
   : > "$TARGETS"
   printf "\n%s[+]%s Targets cleared\n" "$C_GREEN" "$C_RESET"
   pause
 }
-
 targets_menu(){
   while true; do
     banner
     box_top
     box_ln "${C_BOLD}Targets${C_RESET}"
     box_ln ""
-    box_ln "Stored automatically in: ${C_CYAN}${TARGETS}${C_RESET}"
+    box_ln "Stored: ${C_CYAN}${TARGETS}${C_RESET}"
     box_ln ""
     box_ln "${C_YELLOW}1${C_RESET}) Add targets"
     box_ln "${C_YELLOW}2${C_RESET}) View targets"
@@ -148,6 +226,7 @@ targets_menu(){
   done
 }
 
+# ---------- Settings ----------
 settings_menu(){
   while true; do
     banner
@@ -157,16 +236,12 @@ settings_menu(){
     box_ln "Out: ${C_CYAN}${OUT}${C_RESET}"
     box_ln "Rate: ${C_CYAN}${RATE}${C_RESET}   Threads: ${C_CYAN}${THREADS}${C_RESET}   Depth: ${C_CYAN}${DEPTH}${C_RESET}"
     box_ln "Wordlist: ${C_CYAN}${WORDLIST:-<unset>}${C_RESET}"
-    box_ln "Nuclei tags: ${C_CYAN}${NUCLEI_TAGS}${C_RESET}"
-    box_ln "Severity: ${C_CYAN}${SEVERITY}${C_RESET}"
     box_ln ""
     box_ln "${C_YELLOW}1${C_RESET}) Output directory"
     box_ln "${C_YELLOW}2${C_RESET}) Rate limit"
     box_ln "${C_YELLOW}3${C_RESET}) Threads"
     box_ln "${C_YELLOW}4${C_RESET}) Crawl depth"
     box_ln "${C_YELLOW}5${C_RESET}) Wordlist path"
-    box_ln "${C_YELLOW}6${C_RESET}) Nuclei tags"
-    box_ln "${C_YELLOW}7${C_RESET}) Nuclei severity"
     box_ln "${C_YELLOW}b${C_RESET}) Back"
     box_bot
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
@@ -177,9 +252,7 @@ settings_menu(){
       2) printf "Rate [%s]: " "$RATE"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && RATE="$v" ;;
       3) printf "Threads [%s]: " "$THREADS"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && THREADS="$v" ;;
       4) printf "Depth [%s]: " "$DEPTH"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && DEPTH="$v" ;;
-      5) printf "Wordlist (blank unset): "; IFS= read -r v || true; WORDLIST="$(trim "$v")" ;;
-      6) printf "Nuclei tags [%s]: " "$NUCLEI_TAGS"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && NUCLEI_TAGS="$v" ;;
-      7) printf "Severity [%s]: " "$SEVERITY"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && SEVERITY="$v" ;;
+      5) printf "Wordlist path (blank unset): "; IFS= read -r v || true; WORDLIST="$(trim "$v")" ;;
       b|B) return 0 ;;
       *) ;;
     esac
@@ -191,19 +264,17 @@ doctor_menu(){
   box_top
   box_ln "${C_BOLD}Doctor${C_RESET}"
   box_ln ""
-  box_ln "Dependency presence (optional)."
+  box_ln "Core deps:"
   box_ln ""
   box_bot
   echo
-  for c in bash sed awk grep sort nl tput; do
-    if need "$c"; then
-      printf "%sOK%s   %s\n" "$C_GREEN" "$C_RESET" "$c"
-    else
-      printf "%sMISS%s %s\n" "$C_RED" "$C_RESET" "$c"
+  for c in bash sed awk grep sort nl tput tee date; do
+    if need "$c"; then printf "%sOK%s   %s\n" "$C_GREEN" "$C_RESET" "$c"
+    else printf "%sMISS%s %s\n" "$C_RED" "$C_RESET" "$c"
     fi
   done
   echo
-  echo "${C_DIM}Your modules can require additional tools. Add checks inside module bodies.${C_RESET}"
+  echo "${C_DIM}Module-specific deps are checked by your module commands.${C_RESET}"
   pause
 }
 
@@ -217,41 +288,177 @@ status_panel(){
   box_bot
 }
 
-auth_gate(){
+# ---------- Ethics Gate ----------
+ethics_gate(){
   banner
   status_panel
   box_top
-  box_ln "${C_BOLD}Authorization Gate${C_RESET}"
+  box_ln "${C_BOLD}Ethics Gate${C_RESET}"
   box_ln ""
-  box_ln "Type the phrase exactly to proceed:"
-  box_ln "  ${C_CYAN}${AUTH_PHRASE}${C_RESET}"
+  while IFS= read -r l; do
+    box_ln "$l"
+  done <<<"$AUTH_GATE_TEXT"
   box_ln ""
-  box_ln "${C_YELLOW}b${C_RESET}) Back"
+  box_ln "Type ${C_CYAN}yes${C_RESET} to continue, or ${C_YELLOW}b${C_RESET} to go back."
   box_bot
+
   printf "\n%s> %s" "$C_BOLD" "$C_RESET"
   IFS= read -r a || true
   a="$(trim "$a")"
   [[ "$(lower "$a")" == "b" ]] && return 1
-  [[ "$a" == "$AUTH_PHRASE" ]]
+  [[ "$(lower "$a")" == "yes" ]]
 }
 
+# ---------- Resume markers ----------
 mark_done(){ touch "$DONE/$1.done"; }
 is_done(){ [[ -f "$DONE/$1.done" ]]; }
-
-write_auth_log(){
-  local now
-  now="$(date -Is)"
-  {
-    echo "Generated: $now"
-    echo "Authorization phrase accepted."
-    echo "Targets:"
-    cat "$TARGETS"
-  } > "$RUN/AUTHORIZATION.txt"
+reset_resume(){
+  rm -f "$DONE/"*.done 2>/dev/null || true
 }
 
+# ---------- modules.conf ----------
+ensure_conf(){
+  if [[ ! -f "$CONF" ]]; then
+    cat >"$CONF" <<'EOF'
+# ZeroScope modules.conf
+# Define a command per module. Empty means "not configured".
+# Variables you can use:
+#   {TARGETS}  -> out/run/targets.txt
+#   {OUT}      -> out/run
+#   {EVID}     -> out/run/evidence
+#   {LOGS}     -> out/run/logs
+#   {WORDLIST} -> wordlist path (if set)
+#   {RATE}     -> rate
+#   {THREADS}  -> threads
+#   {DEPTH}    -> depth
+#
+# Example (safe demo):
+# RECON_CMD=echo "recon would run here"; sleep 1; echo "done"
+#
+RECON_CMD=
+URLS_CMD=
+CRAWL_CMD=
+PARAMS_CMD=
+FFUF_CMD=
+NUCLEI_CMD=
+NMAP_CMD=
+REPORT_CMD=
+EOF
+  fi
+}
+
+conf_get(){
+  local key="$1"
+  local val=""
+  if [[ -f "$CONF" ]]; then
+    val="$(grep -E "^${key}=" "$CONF" 2>/dev/null | head -n1 | sed "s/^${key}=//")" || true
+  fi
+  printf "%s" "$val"
+}
+
+conf_set(){
+  local key="$1"
+  local value="$2"
+  if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+    awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k{$2=v} {print}' "$CONF" > "$CONF.tmp"
+    mv "$CONF.tmp" "$CONF"
+  else
+    echo "${key}=${value}" >> "$CONF"
+  fi
+}
+
+subst_vars(){
+  local s="$1"
+  s="${s//\{TARGETS\}/$TARGETS}"
+  s="${s//\{OUT\}/$RUN}"
+  s="${s//\{EVID\}/$EVID}"
+  s="${s//\{LOGS\}/$LOGS}"
+  s="${s//\{WORDLIST\}/$WORDLIST}"
+  s="${s//\{RATE\}/$RATE}"
+  s="${s//\{THREADS\}/$THREADS}"
+  s="${s//\{DEPTH\}/$DEPTH}"
+  printf "%s" "$s"
+}
+
+module_config_menu(){
+  while true; do
+    banner
+    status_panel
+    box_top
+    box_ln "${C_BOLD}Module Config${C_RESET}"
+    box_ln ""
+    box_ln "Config file: ${C_CYAN}${CONF}${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Recon command"
+    box_ln "${C_YELLOW}2${C_RESET}) URL Discovery command"
+    box_ln "${C_YELLOW}3${C_RESET}) Crawl command"
+    box_ln "${C_YELLOW}4${C_RESET}) Params command"
+    box_ln "${C_YELLOW}5${C_RESET}) ffuf command"
+    box_ln "${C_YELLOW}6${C_RESET}) Nuclei command"
+    box_ln "${C_YELLOW}7${C_RESET}) nmap command"
+    box_ln "${C_YELLOW}8${C_RESET}) Report command"
+    box_ln ""
+    box_ln "${C_YELLOW}v${C_RESET}) View raw modules.conf"
+    box_ln "${C_YELLOW}b${C_RESET}) Back"
+    box_bot
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      1) edit_cmd "RECON_CMD" "Recon" ;;
+      2) edit_cmd "URLS_CMD" "URL Discovery" ;;
+      3) edit_cmd "CRAWL_CMD" "Crawl" ;;
+      4) edit_cmd "PARAMS_CMD" "Params" ;;
+      5) edit_cmd "FFUF_CMD" "ffuf" ;;
+      6) edit_cmd "NUCLEI_CMD" "Nuclei" ;;
+      7) edit_cmd "NMAP_CMD" "nmap" ;;
+      8) edit_cmd "REPORT_CMD" "Report" ;;
+      v|V)
+        banner
+        status_panel
+        echo
+        sed -n '1,200p' "$CONF" 2>/dev/null || true
+        pause
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+edit_cmd(){
+  local key="$1"
+  local title="$2"
+  local cur
+  cur="$(conf_get "$key")"
+  banner
+  status_panel
+  box_top
+  box_ln "${C_BOLD}${title} Command${C_RESET}"
+  box_ln ""
+  box_ln "Enter a one-line command string."
+  box_ln "Leave blank to keep unchanged."
+  box_ln ""
+  box_ln "Variables: {TARGETS} {OUT} {EVID} {LOGS} {WORDLIST} {RATE} {THREADS} {DEPTH}"
+  box_ln ""
+  box_bot
+  echo
+  printf "%sCurrent:%s %s\n\n" "$C_DIM" "$C_RESET" "${cur:-<unset>}"
+  printf "%sNew> %s" "$C_BOLD" "$C_RESET"
+  IFS= read -r v || true
+  v="$(trim "$v")"
+  if [[ -n "$v" ]]; then
+    conf_set "$key" "$v"
+    printf "\n%s[+]%s Saved.\n" "$C_GREEN" "$C_RESET"
+  else
+    printf "\n%s[~]%s Unchanged.\n" "$C_DIM" "$C_RESET"
+  fi
+  pause
+}
+
+# ---------- Report scaffolding ----------
 ensure_report(){
-  local rep="$RUN/REPORT.md"
-  if [[ ! -f "$rep" ]]; then
+  if [[ ! -f "$REPORT" ]]; then
     {
       echo "# ZeroScope Report"
       echo
@@ -266,9 +473,10 @@ ensure_report(){
         echo "- (none)"
       fi
       echo
-      echo "## Evidence Index"
+      echo "## Evidence"
       echo
-      echo "- evidence/ (module outputs)"
+      echo "- Logs: \`logs/\`"
+      echo "- Evidence: \`evidence/\`"
       echo
       echo "## Hosts"
       echo
@@ -277,16 +485,15 @@ ensure_report(){
           [[ -z "$t" ]] && continue
           echo "### $t"
           echo
-          echo "- Evidence:"
-          echo "  - $(printf '%q\n' "evidence/$t/")"
+          echo "- Evidence folder: \`evidence/$t/\`"
           echo
         done < "$TARGETS"
       fi
-    } > "$rep"
+    } > "$REPORT"
   fi
 }
 
-ensure_host_evidence_dirs(){
+ensure_host_dirs(){
   if [[ -s "$TARGETS" ]]; then
     while read -r t; do
       [[ -z "$t" ]] && continue
@@ -295,95 +502,96 @@ ensure_host_evidence_dirs(){
   fi
 }
 
-module_placeholder_run(){
-  local mod="$1"
-  local title="$2"
-  local outdir="$3"
-
-  mkdir -p "$outdir"
-  local now
-  now="$(date -Is)"
+write_auth_log(){
   {
-    echo "Module: $mod"
-    echo "Title: $title"
-    echo "Time: $now"
+    echo "Ethics gate accepted at: $(date -Is)"
     echo
-    echo "This is a placeholder module."
-    echo "Fill in this module body inside zeroscope to run your authorized toolchain."
-  } > "$outdir/README.txt"
+    echo "Targets:"
+    cat "$TARGETS"
+    echo
+    echo "Selected: $(sel_summary)"
+  } > "$AUTH_FILE"
+}
+
+# ---------- Streaming runner ----------
+run_stream(){
+  local title="$1"
+  local logfile="$2"
+  shift 2
+
+  mkdir -p "$(dirname "$logfile")"
+  : >> "$logfile"
+
+  printf "%s[run]%s  %s\n" "$C_CYAN" "$C_RESET" "$title"
+  printf "%s[log]%s  %s\n\n" "$C_DIM" "$C_RESET" "$logfile"
+
+  set +e
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "$@" 2>&1 | tee -a "$logfile"
+    rc=${PIPESTATUS[0]}
+  else
+    "$@" 2>&1 | tee -a "$logfile"
+    rc=${PIPESTATUS[0]}
+  fi
+  set -e
+
+  echo
+  if [[ "$rc" -eq 0 ]]; then
+    printf "%s[+]%s %s finished\n" "$C_GREEN" "$C_RESET" "$title"
+  else
+    printf "%s[!]%s %s exited (%s)\n" "$C_YELLOW" "$C_RESET" "$title" "$rc"
+  fi
+  return "$rc"
+}
+
+module_cmd_key(){
+  case "$1" in
+    recon) echo "RECON_CMD" ;;
+    urls) echo "URLS_CMD" ;;
+    crawl) echo "CRAWL_CMD" ;;
+    params) echo "PARAMS_CMD" ;;
+    ffuf) echo "FFUF_CMD" ;;
+    nuclei) echo "NUCLEI_CMD" ;;
+    nmap) echo "NMAP_CMD" ;;
+    report) echo "REPORT_CMD" ;;
+    *) echo "" ;;
+  esac
 }
 
 run_module(){
-  local key="$1"
+  local id="$1"
   local title="$2"
 
-  if is_done "$key"; then
+  if is_done "$id"; then
     printf "%s[skip]%s %s (resume)\n" "$C_DIM" "$C_RESET" "$title"
     return 0
   fi
 
-  printf "%s[run]%s  %s\n" "$C_CYAN" "$C_RESET" "$title"
-  local outdir="$EVID/_$key"
-  case "$key" in
-    recon) module_placeholder_run "$key" "$title" "$outdir" ;;
-    urls) module_placeholder_run "$key" "$title" "$outdir" ;;
-    crawl) module_placeholder_run "$key" "$title" "$outdir" ;;
-    params) module_placeholder_run "$key" "$title" "$outdir" ;;
-    nuclei) module_placeholder_run "$key" "$title" "$outdir" ;;
-    ffuf) module_placeholder_run "$key" "$title" "$outdir" ;;
-    nmap) module_placeholder_run "$key" "$title" "$outdir" ;;
-    report)
-      ensure_report
-      module_placeholder_run "$key" "$title" "$outdir"
-      ;;
-    *) module_placeholder_run "$key" "$title" "$outdir" ;;
-  esac
-  mark_done "$key"
-}
-
-reset_selection(){
-  SEL_recon=0
-  SEL_urls=0
-  SEL_crawl=0
-  SEL_params=0
-  SEL_nuclei=0
-  SEL_ffuf=0
-  SEL_nmap=0
-  SEL_report=0
-}
-
-toggle(){
-  local name="$1"
-  local v="${!name}"
-  if [[ "$v" -eq 1 ]]; then
-    printf -v "$name" "0"
-  else
-    printf -v "$name" "1"
+  local key
+  key="$(module_cmd_key "$id")"
+  if [[ -z "$key" ]]; then
+    printf "%s[!]%s Unknown module: %s\n" "$C_YELLOW" "$C_RESET" "$id"
+    return 1
   fi
-}
 
-sel_mark(){
-  local v="$1"
-  if [[ "$v" -eq 1 ]]; then
-    printf "%s[x]%s" "$C_GREEN" "$C_RESET"
-  else
-    printf "%s[ ]%s" "$C_DIM" "$C_RESET"
+  local raw
+  raw="$(conf_get "$key")"
+  raw="$(trim "$raw")"
+
+  if [[ -z "$raw" ]]; then
+    printf "%s[!]%s %s not configured (set %s in Module Config)\n" "$C_YELLOW" "$C_RESET" "$title" "$key"
+    return 1
   fi
-}
 
-sel_summary(){
-  local s=""
-  [[ "$SEL_recon" -eq 1 ]] && s="$s recon"
-  [[ "$SEL_urls" -eq 1 ]] && s="$s urls"
-  [[ "$SEL_crawl" -eq 1 ]] && s="$s crawl"
-  [[ "$SEL_params" -eq 1 ]] && s="$s params"
-  [[ "$SEL_nuclei" -eq 1 ]] && s="$s nuclei"
-  [[ "$SEL_ffuf" -eq 1 ]] && s="$s ffuf"
-  [[ "$SEL_nmap" -eq 1 ]] && s="$s nmap"
-  [[ "$SEL_report" -eq 1 ]] && s="$s report"
-  s="$(trim "$s")"
-  [[ -z "$s" ]] && s="<none>"
-  printf "%s" "$s"
+  local cmd
+  cmd="$(subst_vars "$raw")"
+
+  local outdir="$EVID/_${id}"
+  mkdir -p "$outdir"
+  local logfile="$LOGS/${id}.log"
+
+  run_stream "$title" "$logfile" bash -lc "$cmd"
+  mark_done "$id"
 }
 
 run_selected(){
@@ -397,12 +605,11 @@ run_selected(){
     pause
     return 1
   fi
-  if ! auth_gate; then
+  if ! ethics_gate; then
     return 0
   fi
 
-  mkdir -p "$EVID"
-  ensure_host_evidence_dirs
+  ensure_host_dirs
   ensure_report
   write_auth_log
 
@@ -417,19 +624,21 @@ run_selected(){
   box_bot
   echo
 
-  [[ "$SEL_recon" -eq 1 ]] && run_module "recon" "Recon (placeholder)"
-  [[ "$SEL_urls" -eq 1 ]] && run_module "urls" "URL Discovery (placeholder)"
-  [[ "$SEL_crawl" -eq 1 ]] && run_module "crawl" "Crawl (placeholder)"
-  [[ "$SEL_params" -eq 1 ]] && run_module "params" "Params (placeholder)"
-  [[ "$SEL_nuclei" -eq 1 ]] && run_module "nuclei" "Nuclei (placeholder)"
-  [[ "$SEL_ffuf" -eq 1 ]] && run_module "ffuf" "ffuf (placeholder)"
-  [[ "$SEL_nmap" -eq 1 ]] && run_module "nmap" "nmap (placeholder)"
-  [[ "$SEL_report" -eq 1 ]] && run_module "report" "Report (placeholder)"
+  local failed=0
+  [[ "$SEL_recon" -eq 1 ]] && run_module "recon" "Recon" || true
+  [[ "$SEL_urls" -eq 1 ]] && run_module "urls" "URL Discovery" || true
+  [[ "$SEL_crawl" -eq 1 ]] && run_module "crawl" "Crawl" || true
+  [[ "$SEL_params" -eq 1 ]] && run_module "params" "Params" || true
+  [[ "$SEL_ffuf" -eq 1 ]] && run_module "ffuf" "ffuf" || true
+  [[ "$SEL_nuclei" -eq 1 ]] && run_module "nuclei" "Nuclei" || true
+  [[ "$SEL_nmap" -eq 1 ]] && run_module "nmap" "nmap" || true
+  [[ "$SEL_report" -eq 1 ]] && run_module "report" "Report" || true
 
   echo
   printf "%s[+]%s Done.\n" "$C_GREEN" "$C_RESET"
-  printf "%sReport:%s %s\n" "$C_DIM" "$C_RESET" "$RUN/REPORT.md"
-  printf "%sEvidence:%s %s\n" "$C_DIM" "$C_RESET" "$RUN/evidence/"
+  printf "%sReport:%s %s\n" "$C_DIM" "$C_RESET" "$REPORT"
+  printf "%sLogs:%s   %s\n" "$C_DIM" "$C_RESET" "$LOGS/"
+  printf "%sEvid:%s   %s\n" "$C_DIM" "$C_RESET" "$EVID/"
   pause
 }
 
@@ -444,8 +653,8 @@ modules_menu(){
     box_ln "2) $(sel_mark "$SEL_urls") URL Discovery"
     box_ln "3) $(sel_mark "$SEL_crawl") Crawl"
     box_ln "4) $(sel_mark "$SEL_params") Params"
-    box_ln "5) $(sel_mark "$SEL_nuclei") Nuclei"
-    box_ln "6) $(sel_mark "$SEL_ffuf") ffuf"
+    box_ln "5) $(sel_mark "$SEL_ffuf") ffuf"
+    box_ln "6) $(sel_mark "$SEL_nuclei") Nuclei"
     box_ln "7) $(sel_mark "$SEL_nmap") nmap"
     box_ln "8) $(sel_mark "$SEL_report") Report"
     box_ln ""
@@ -464,13 +673,13 @@ modules_menu(){
       2) toggle SEL_urls ;;
       3) toggle SEL_crawl ;;
       4) toggle SEL_params ;;
-      5) toggle SEL_nuclei ;;
-      6) toggle SEL_ffuf ;;
+      5) toggle SEL_ffuf ;;
+      6) toggle SEL_nuclei ;;
       7) toggle SEL_nmap ;;
       8) toggle SEL_report ;;
       r|R) run_selected ;;
       c|C) reset_selection ;;
-      x|X) rm -f "$DONE/"*.done 2>/dev/null || true; printf "\n%s[+]%s Resume state reset.\n" "$C_GREEN" "$C_RESET"; pause ;;
+      x|X) reset_resume; printf "\n%s[+]%s Resume state reset.\n" "$C_GREEN" "$C_RESET"; pause ;;
       b|B) return 0 ;;
       *) ;;
     esac
@@ -488,8 +697,9 @@ main_menu(){
     box_ln ""
     box_ln "${C_YELLOW}1${C_RESET}) Targets"
     box_ln "${C_YELLOW}2${C_RESET}) Modules"
-    box_ln "${C_YELLOW}3${C_RESET}) Settings"
-    box_ln "${C_YELLOW}4${C_RESET}) Doctor"
+    box_ln "${C_YELLOW}3${C_RESET}) Module Config"
+    box_ln "${C_YELLOW}4${C_RESET}) Settings"
+    box_ln "${C_YELLOW}5${C_RESET}) Doctor"
     box_ln ""
     box_ln "${C_YELLOW}q${C_RESET}) Quit"
     box_bot
@@ -499,8 +709,9 @@ main_menu(){
     case "$c" in
       1) targets_menu ;;
       2) modules_menu ;;
-      3) settings_menu ;;
-      4) doctor_menu ;;
+      3) module_config_menu ;;
+      4) settings_menu ;;
+      5) doctor_menu ;;
       q|Q) exit 0 ;;
       *) ;;
     esac
