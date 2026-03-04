@@ -28,7 +28,7 @@ ZeroScope chains common recon utilities into a single workflow:
 ### Recommended install
 
 ```bash
-git clone https://github.com/YOURNAME/zeroscope.git
+git clone https://github.com/redstoning/zeroscope.git
 cd zeroscope
 chmod +x install.sh zeroscope
 ./install.sh
