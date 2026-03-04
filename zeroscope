@@ -4,23 +4,27 @@ set -euo pipefail
 if command -v tput >/dev/null 2>&1; then
   C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
   C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
-  C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"
+  C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"; C_WHITE="$(tput setaf 7)"
 else
   C_RESET=""; C_BOLD=""; C_DIM=""
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
 fi
 
-cls() { printf "\033c"; }
-pause() { printf "\n%sPress Enter to continue...%s" "$C_DIM" "$C_RESET"; IFS= read -r _; }
-need() { command -v "$1" >/dev/null 2>&1 || return 1; }
+cls(){ printf "\033c"; }
+pause(){ printf "\n%sPress Enter...%s" "$C_DIM" "$C_RESET"; IFS= read -r _; }
+trim(){ printf "%s" "$1" | sed 's/\r//g' | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
+lower(){ printf "%s" "$1" | tr 'A-Z' 'a-z'; }
+need(){ command -v "$1" >/dev/null 2>&1; }
 
-box_top()    { printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 70))" "$C_RESET"; }
-box_bottom() { printf "%s└%s┘%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 70))" "$C_RESET"; }
-box_line()   { printf "%s│%s %-70s %s│%s\n" "$C_MAGENTA" "$C_RESET" "$1" "$C_MAGENTA" "$C_RESET"; }
+W=76
+line(){ printf "%s" "$(printf '─%.0s' $(seq 1 "$W"))"; }
+box_top(){ printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(line)" "$C_RESET"; }
+box_bot(){ printf "%s└%s┘%s\n" "$C_MAGENTA" "$(line)" "$C_RESET"; }
+box_ln(){ printf "%s│%s %-*s %s│%s\n" "$C_MAGENTA" "$C_RESET" "$W" "$1" "$C_MAGENTA" "$C_RESET"; }
 
-banner() {
+banner(){
   cls
-  cat << "EOF"
+  cat <<'EOF'
 
  ______                 _____                      
 |___  /                /  ___|                     
@@ -36,304 +40,501 @@ banner() {
 EOF
 }
 
-normalize_target() {
-  echo "$1" \
-    | sed 's/\r//g' \
-    | sed 's#^https\?://##g' \
-    | sed 's#/.*$##g' \
-    | sed 's/[[:space:]]//g' \
-    | tr 'A-Z' 'a-z'
-}
-
 OUT="out"
 RUN=""
-TARGETS_FILE=""
+STATE=""
+DONE=""
+TARGETS=""
 WORDLIST=""
 RATE="10"
-CONCURRENCY="50"
+THREADS="50"
 DEPTH="3"
 NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
 SEVERITY="low,medium,high,critical"
+AUTH_PHRASE="I_HAVE_AUTHORIZATION"
 
-init_run() {
+DO_RECON=0
+DO_URLS=0
+DO_CRAWL=0
+DO_PARAMS=0
+DO_RANK=0
+DO_REPORT=0
+DO_NUCLEI=0
+DO_FFUF=0
+DO_NMAP=0
+
+reset_modules(){
+  DO_RECON=0; DO_URLS=0; DO_CRAWL=0; DO_PARAMS=0; DO_RANK=0; DO_REPORT=0
+  DO_NUCLEI=0; DO_FFUF=0; DO_NMAP=0
+}
+
+init_run(){
   mkdir -p "$OUT/run"
   RUN="$OUT/run"
-  TARGETS_FILE="$RUN/targets.txt"
-  : > "$TARGETS_FILE"
-  mkdir -p "$RUN/evidence"
+  STATE="$RUN/state"
+  DONE="$STATE/done"
+  mkdir -p "$RUN/evidence" "$STATE" "$DONE"
+  TARGETS="$RUN/targets.txt"
+  touch "$TARGETS"
 }
 
-deps_status() {
-  local missing=0
+normalize_target(){
+  local x
+  x="$(trim "$1")"
+  x="$(printf "%s" "$x" | sed 's#^https\?://##g' | sed 's#/.*$##g' | sed 's/[[:space:]]//g')"
+  x="$(lower "$x")"
+  printf "%s" "$x"
+}
+
+targets_count(){ grep -c "." "$TARGETS" 2>/dev/null || echo 0; }
+
+show_targets(){
+  echo
+  if [[ -s "$TARGETS" ]]; then
+    nl -ba "$TARGETS"
+  else
+    echo "No targets saved."
+  fi
+}
+
+targets_add(){
+  echo
+  echo "${C_DIM}Paste targets one per line. Blank line = finish. done = finish. b = back.${C_RESET}"
+  echo
+  while true; do
+    printf "> "
+    IFS= read -r line || true
+    line="$(trim "$line")"
+    local l
+    l="$(lower "$line")"
+    [[ "$l" == "b" ]] && return 0
+    [[ -z "$line" ]] && break
+    [[ "$l" == "done" ]] && break
+    local t
+    t="$(normalize_target "$line")"
+    [[ -z "$t" ]] && continue
+    echo "$t" >> "$TARGETS"
+    printf "%s[+]%s %s\n" "$C_GREEN" "$C_RESET" "$t"
+  done
+  sort -u "$TARGETS" -o "$TARGETS"
+  echo
+  printf "%s[+]%s Saved: %s targets\n" "$C_GREEN" "$C_RESET" "$(targets_count)"
+  show_targets
+  echo
+  pause
+}
+
+targets_clear(){
+  : > "$TARGETS"
+  printf "\n%s[+]%s Targets cleared\n" "$C_GREEN" "$C_RESET"
+  pause
+}
+
+targets_menu(){
+  while true; do
+    banner
+    box_top
+    box_ln "${C_BOLD}Targets${C_RESET}"
+    box_ln ""
+    box_ln "Stored automatically in: ${C_CYAN}${TARGETS}${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Add targets"
+    box_ln "${C_YELLOW}2${C_RESET}) View targets"
+    box_ln "${C_YELLOW}3${C_RESET}) Clear targets"
+    box_ln "${C_YELLOW}b${C_RESET}) Back"
+    box_bot
+    printf "\n%sTargets:%s %s\n" "$C_DIM" "$C_RESET" "$(targets_count)"
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      1) targets_add ;;
+      2) show_targets; echo; pause ;;
+      3) targets_clear ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+settings_menu(){
+  while true; do
+    banner
+    box_top
+    box_ln "${C_BOLD}Settings${C_RESET}"
+    box_ln ""
+    box_ln "Out: ${C_CYAN}${OUT}${C_RESET}"
+    box_ln "Rate: ${C_CYAN}${RATE}${C_RESET}   Threads: ${C_CYAN}${THREADS}${C_RESET}   Depth: ${C_CYAN}${DEPTH}${C_RESET}"
+    box_ln "Wordlist: ${C_CYAN}${WORDLIST:-<unset>}${C_RESET}"
+    box_ln "Nuclei tags: ${C_CYAN}${NUCLEI_TAGS}${C_RESET}"
+    box_ln "Severity: ${C_CYAN}${SEVERITY}${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Output directory"
+    box_ln "${C_YELLOW}2${C_RESET}) Rate limit"
+    box_ln "${C_YELLOW}3${C_RESET}) Threads"
+    box_ln "${C_YELLOW}4${C_RESET}) Crawl depth"
+    box_ln "${C_YELLOW}5${C_RESET}) Wordlist path"
+    box_ln "${C_YELLOW}6${C_RESET}) Nuclei tags"
+    box_ln "${C_YELLOW}7${C_RESET}) Nuclei severity"
+    box_ln "${C_YELLOW}b${C_RESET}) Back"
+    box_bot
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      1) printf "Out [%s]: " "$OUT"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && OUT="$v"; init_run ;;
+      2) printf "Rate [%s]: " "$RATE"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && RATE="$v" ;;
+      3) printf "Threads [%s]: " "$THREADS"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && THREADS="$v" ;;
+      4) printf "Depth [%s]: " "$DEPTH"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && DEPTH="$v" ;;
+      5) printf "Wordlist (blank unset): "; IFS= read -r v || true; WORDLIST="$(trim "$v")" ;;
+      6) printf "Nuclei tags [%s]: " "$NUCLEI_TAGS"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && NUCLEI_TAGS="$v" ;;
+      7) printf "Severity [%s]: " "$SEVERITY"; IFS= read -r v || true; v="$(trim "$v")"; [[ -n "$v" ]] && SEVERITY="$v" ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+doctor_menu(){
+  banner
+  box_top
+  box_ln "${C_BOLD}Doctor${C_RESET}"
+  box_ln ""
+  box_ln "Checks for common dependencies."
+  box_ln ""
+  box_bot
+  echo
   for c in rg jq subfinder dnsx httpx gau waybackurls katana nuclei ffuf nmap; do
     if need "$c"; then
-      printf "%sOK%s  %s\n" "$C_GREEN" "$C_RESET" "$c"
+      printf "%sOK%s   %s\n" "$C_GREEN" "$C_RESET" "$c"
     else
       printf "%sMISS%s %s\n" "$C_RED" "$C_RESET" "$c"
-      missing=1
     fi
   done
-  return "$missing"
+  pause
 }
 
-targets_page() {
+status_panel(){
+  box_top
+  box_ln "${C_BOLD}Session${C_RESET}"
+  box_ln ""
+  box_ln "Targets: ${C_CYAN}$(targets_count)${C_RESET}   Out: ${C_CYAN}${OUT}${C_RESET}"
+  box_ln "Rate: ${C_CYAN}${RATE}${C_RESET}  Threads: ${C_CYAN}${THREADS}${C_RESET}  Depth: ${C_CYAN}${DEPTH}${C_RESET}"
+  box_ln ""
+  box_bot
+}
+
+auth_gate(){
+  banner
+  status_panel
+  box_top
+  box_ln "${C_BOLD}Authorization Gate${C_RESET}"
+  box_ln ""
+  box_ln "This will generate a runbook for the targets you entered."
+  box_ln "Type the phrase exactly to continue:"
+  box_ln ""
+  box_ln "  ${C_CYAN}${AUTH_PHRASE}${C_RESET}"
+  box_ln ""
+  box_ln "${C_YELLOW}b${C_RESET}) Back"
+  box_bot
+  printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+  IFS= read -r a || true
+  a="$(trim "$a")"
+  [[ "$(lower "$a")" == "b" ]] && return 1
+  [[ "$a" == "$AUTH_PHRASE" ]]
+}
+
+module_header(){
+  banner
+  status_panel
+  box_top
+  box_ln "${C_BOLD}$1${C_RESET}"
+  box_ln ""
+  box_ln "$2"
+  box_ln ""
+  box_ln "${C_YELLOW}r${C_RESET}) Add to selection"
+  box_ln "${C_YELLOW}b${C_RESET}) Back"
+  box_bot
+}
+
+page_recon(){
   while true; do
-    banner
-    box_top
-    box_line "${C_BOLD}Targets${C_RESET} (no files to edit)"
-    box_line ""
-    box_line "Paste domains/hosts one per line. Blank line to finish."
-    box_line "Examples: example.com  api.example.com"
-    box_line ""
-    box_line "${C_YELLOW}1${C_RESET}) Enter targets now"
-    box_line "${C_YELLOW}2${C_RESET}) View current targets"
-    box_line "${C_YELLOW}3${C_RESET}) Clear targets"
-    box_line "${C_YELLOW}b${C_RESET}) Back"
-    box_bottom
-
-    local count
-    count="$(wc -l < "$TARGETS_FILE" 2>/dev/null | tr -d ' ')"
-    echo "${C_DIM}Current targets:${C_RESET} ${C_CYAN}${count}${C_RESET}   (${C_DIM}$TARGETS_FILE${C_RESET})"
+    module_header "Recon" "Module placeholder. Adds recon steps to runbook."
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-
+    IFS= read -r c || true
+    c="$(trim "$c")"
     case "$c" in
-      1)
-        echo
-        echo "${C_DIM}Paste targets now. Blank line to stop.${C_RESET}"
-        while true; do
-          printf "> "
-          IFS= read -r line || true
-          line="$(normalize_target "$line")"
-          [[ -z "$line" ]] && break
-          echo "$line" >> "$TARGETS_FILE"
-        done
-        sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
-        ;;
-      2)
-        echo
-        if [[ -s "$TARGETS_FILE" ]]; then
-          nl -ba "$TARGETS_FILE"
-        else
-          echo "No targets yet."
-        fi
-        pause
-        ;;
-      3)
-        : > "$TARGETS_FILE"
-        ;;
+      r|R) DO_RECON=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
       b|B) return 0 ;;
       *) ;;
     esac
   done
 }
 
-settings_page() {
+page_urls(){
   while true; do
-    banner
-    box_top
-    box_line "${C_BOLD}Settings${C_RESET}"
-    box_line ""
-    box_line "Output: ${C_CYAN}${OUT}${C_RESET}"
-    box_line "Rate: ${C_CYAN}${RATE}${C_RESET}   Concurrency: ${C_CYAN}${CONCURRENCY}${C_RESET}   Depth: ${C_CYAN}${DEPTH}${C_RESET}"
-    box_line "Wordlist: ${C_CYAN}${WORDLIST:-<not set>}${C_RESET}"
-    box_line "Nuclei tags: ${C_CYAN}${NUCLEI_TAGS}${C_RESET}"
-    box_line "Severity: ${C_CYAN}${SEVERITY}${C_RESET}"
-    box_line ""
-    box_line "${C_YELLOW}1${C_RESET}) Output directory"
-    box_line "${C_YELLOW}2${C_RESET}) Rate limit"
-    box_line "${C_YELLOW}3${C_RESET}) Concurrency"
-    box_line "${C_YELLOW}4${C_RESET}) Crawl depth"
-    box_line "${C_YELLOW}5${C_RESET}) Wordlist path"
-    box_line "${C_YELLOW}6${C_RESET}) Nuclei tags"
-    box_line "${C_YELLOW}7${C_RESET}) Nuclei severity"
-    box_line "${C_YELLOW}b${C_RESET}) Back"
-    box_bottom
+    module_header "URL Discovery" "Module placeholder. Adds URL discovery steps to runbook."
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
+    IFS= read -r c || true
+    c="$(trim "$c")"
     case "$c" in
-      1) printf "Out [%s]: " "$OUT"; IFS= read -r v; [[ -n "$v" ]] && OUT="$v"; init_run ;;
-      2) printf "Rate [%s]: " "$RATE"; IFS= read -r v; [[ -n "$v" ]] && RATE="$v" ;;
-      3) printf "Concurrency [%s]: " "$CONCURRENCY"; IFS= read -r v; [[ -n "$v" ]] && CONCURRENCY="$v" ;;
-      4) printf "Depth [%s]: " "$DEPTH"; IFS= read -r v; [[ -n "$v" ]] && DEPTH="$v" ;;
-      5) printf "Wordlist path (blank = unset): "; IFS= read -r v; WORDLIST="$v" ;;
-      6) printf "Nuclei tags [%s]: " "$NUCLEI_TAGS"; IFS= read -r v; [[ -n "$v" ]] && NUCLEI_TAGS="$v" ;;
-      7) printf "Severity [%s]: " "$SEVERITY"; IFS= read -r v; [[ -n "$v" ]] && SEVERITY="$v" ;;
+      r|R) DO_URLS=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
       b|B) return 0 ;;
       *) ;;
     esac
   done
 }
 
-generate_runbook() {
-  if [[ ! -s "$TARGETS_FILE" ]]; then
-    echo "${C_RED}[!]${C_RESET} No targets set."
+page_crawl(){
+  while true; do
+    module_header "Crawl" "Module placeholder. Adds crawling steps to runbook."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      r|R) DO_CRAWL=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_params(){
+  while true; do
+    module_header "Params" "Module placeholder. Adds param extraction steps to runbook."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      r|R) DO_PARAMS=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_scan(){
+  while true; do
+    banner
+    status_panel
+    box_top
+    box_ln "${C_BOLD}Scans${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Nuclei (placeholder)"
+    box_ln "${C_YELLOW}2${C_RESET}) ffuf (placeholder)"
+    box_ln "${C_YELLOW}3${C_RESET}) nmap (placeholder)"
+    box_ln ""
+    box_ln "${C_YELLOW}b${C_RESET}) Back"
+    box_bot
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      1) DO_NUCLEI=1; printf "%s[+]%s Added nuclei\n" "$C_GREEN" "$C_RESET"; pause ;;
+      2) DO_FFUF=1; printf "%s[+]%s Added ffuf\n" "$C_GREEN" "$C_RESET"; pause ;;
+      3) DO_NMAP=1; printf "%s[+]%s Added nmap\n" "$C_GREEN" "$C_RESET"; pause ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_report(){
+  while true; do
+    module_header "Report" "Adds ranking/report steps to runbook and creates REPORT.md."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      r|R) DO_RANK=1; DO_REPORT=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+selected_summary(){
+  local s=""
+  [[ "$DO_RECON" -eq 1 ]] && s="$s recon"
+  [[ "$DO_URLS" -eq 1 ]] && s="$s urls"
+  [[ "$DO_CRAWL" -eq 1 ]] && s="$s crawl"
+  [[ "$DO_PARAMS" -eq 1 ]] && s="$s params"
+  [[ "$DO_NUCLEI" -eq 1 ]] && s="$s nuclei"
+  [[ "$DO_FFUF" -eq 1 ]] && s="$s ffuf"
+  [[ "$DO_NMAP" -eq 1 ]] && s="$s nmap"
+  [[ "$DO_REPORT" -eq 1 ]] && s="$s report"
+  s="$(trim "$s")"
+  [[ -z "$s" ]] && s="<none>"
+  printf "%s" "$s"
+}
+
+generate_runbook(){
+  if [[ "$(targets_count)" -eq 0 ]]; then
+    printf "\n%s[!]%s Add targets first.\n" "$C_YELLOW" "$C_RESET"
     pause
     return 1
   fi
-
-  banner
-  box_top
-  box_line "${C_BOLD}Authorization gate${C_RESET}"
-  box_line ""
-  box_line "This generates a runbook for the targets you entered."
-  box_line "Only proceed if you have explicit authorization."
-  box_line ""
-  box_bottom
-  echo
-  printf "%sType: I_HAVE_AUTHORIZATION > %s" "$C_BOLD" "$C_RESET"
-  IFS= read -r ack
-  if [[ "$ack" != "I_HAVE_AUTHORIZATION" ]]; then
-    echo "${C_YELLOW}[!]${C_RESET} Cancelled."
-    pause
-    return 1
+  if ! auth_gate; then
+    return 0
   fi
 
   local cmds="$RUN/COMMANDS.sh"
-  local report="$RUN/REPORT.md"
+  local rep="$RUN/REPORT.md"
   local now
   now="$(date -Is)"
 
   {
     echo "#!/usr/bin/env bash"
     echo "set -euo pipefail"
-    echo
     echo "OUTDIR=\"$RUN\""
-    echo "TARGETS=\"$TARGETS_FILE\""
+    echo "TARGETS=\"$TARGETS\""
     echo "RATE=\"$RATE\""
-    echo "CONCURRENCY=\"$CONCURRENCY\""
+    echo "THREADS=\"$THREADS\""
     echo "DEPTH=\"$DEPTH\""
+    echo "WORDLIST=\"$WORDLIST\""
     echo "NUCLEI_TAGS=\"$NUCLEI_TAGS\""
     echo "SEVERITY=\"$SEVERITY\""
-    echo "WORDLIST=\"${WORDLIST}\""
-    echo
     echo "mkdir -p \"\$OUTDIR/evidence\""
-    echo
+    echo "echo \"[runbook] generated: $now\""
     echo "echo \"[runbook] targets: \$TARGETS\""
-    echo "echo \"[runbook] output:  \$OUTDIR\""
     echo
-    echo "echo \"[1] subdomains (subfinder)\""
-    echo "subfinder -silent -dL \"\$TARGETS\" -all -o \"\$OUTDIR/subs.txt\" || true"
+    echo "echo \"[NOTE] This runbook is generated from UI selections.\""
+    echo "echo \"[NOTE] Review commands before running.\""
     echo
-    echo "echo \"[2] resolve (dnsx)\""
-    echo "cat \"\$TARGETS\" \"\$OUTDIR/subs.txt\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/hosts.txt\""
-    echo "dnsx -silent -l \"\$OUTDIR/hosts.txt\" -a -aaaa -resp -o \"\$OUTDIR/resolved.txt\" || true"
-    echo "cut -d' ' -f1 \"\$OUTDIR/resolved.txt\" | sed '/^$/d' | sort -u > \"\$OUTDIR/resolved_hosts.txt\""
-    echo
-    echo "echo \"[3] probe (httpx)\""
-    echo "httpx -silent -l \"\$OUTDIR/resolved_hosts.txt\" -title -tech-detect -status-code -content-length -server -location \\"
-    echo "  -threads \"\$CONCURRENCY\" -rate-limit \"\$RATE\" -json -o \"\$OUTDIR/httpx.json\" || true"
-    echo "jq -r 'select(.url!=null) | .url' \"\$OUTDIR/httpx.json\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/live_urls.txt\""
-    echo "jq -r 'select(.host!=null) | .host' \"\$OUTDIR/httpx.json\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/live_hosts.txt\""
-    echo
-    echo "echo \"[4] urls (gau + waybackurls)\""
-    echo "cat \"\$OUTDIR/live_hosts.txt\" | gau --subs 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/gau_urls.txt\" || true"
-    echo "cat \"\$OUTDIR/live_hosts.txt\" | waybackurls 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/wayback_urls.txt\" || true"
-    echo "cat \"\$OUTDIR/gau_urls.txt\" \"\$OUTDIR/wayback_urls.txt\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/urls_merged.txt\" || true"
-    echo
-    echo "echo \"[5] crawl (katana)\""
-    echo "katana -silent -list \"\$OUTDIR/live_urls.txt\" -depth \"\$DEPTH\" -jc -jsl -kf -c \"\$CONCURRENCY\" -rl \"\$RATE\" \\"
-    echo "  -o \"\$OUTDIR/katana_urls.txt\" || true"
-    echo
-    echo "echo \"[6] params\""
-    echo "rg -n '\\?' \"\$OUTDIR/urls_merged.txt\" \"\$OUTDIR/katana_urls.txt\" 2>/dev/null | cut -d: -f2- | sed '/^$/d' | sort -u > \"\$OUTDIR/urls_params_all.txt\" || true"
-    echo
-    echo "echo \"[7] nuclei (optional)\""
-    echo "nuclei -silent -l \"\$OUTDIR/live_urls.txt\" -tags \"\$NUCLEI_TAGS\" -severity \"\$SEVERITY\" -rl \"\$RATE\" -c \"\$CONCURRENCY\" \\"
-    echo "  -jsonl -o \"\$OUTDIR/evidence/nuclei.jsonl\" || true"
-    echo
-    echo "echo \"[8] nmap (optional)\""
-    echo "nmap -sV -sC -T4 --top-ports 200 -iL \"\$OUTDIR/live_hosts.txt\" -oN \"\$OUTDIR/evidence/nmap_top200.txt\" || true"
-    echo
-    echo "echo \"[9] ffuf (optional)\""
-    echo "if [[ -n \"\$WORDLIST\" && -f \"\$WORDLIST\" ]]; then"
-    echo "  mkdir -p \"\$OUTDIR/evidence/ffuf\""
-    echo "  while read -r u; do"
-    echo "    [[ -z \"\$u\" ]] && continue"
-    echo "    hs=\$(echo \"\$u\" | sed 's#^https\\?://##g' | sed 's#/.*\$##g' | tr '/:?' '___')"
-    echo "    ffuf -w \"\$WORDLIST\" -u \"\$u/FUZZ\" -t 30 -rate \"\$RATE\" -timeout 8 \\"
-    echo "      -mc 200,204,301,302,307,308,401,403,405 -of json -o \"\$OUTDIR/evidence/ffuf/\${hs}.json\" >/dev/null 2>&1 || true"
-    echo "  done < \"\$OUTDIR/live_urls.txt\""
-    echo "else"
-    echo "  echo \"[ffuf] wordlist not set; skipping\""
-    echo "fi"
-    echo
+    if [[ "$DO_RECON" -eq 1 ]]; then
+      echo "echo \"[recon] (placeholder)\""
+      echo "echo \"recon steps would go here\""
+      echo
+    fi
+    if [[ "$DO_URLS" -eq 1 ]]; then
+      echo "echo \"[urls] (placeholder)\""
+      echo "echo \"url discovery steps would go here\""
+      echo
+    fi
+    if [[ "$DO_CRAWL" -eq 1 ]]; then
+      echo "echo \"[crawl] (placeholder)\""
+      echo "echo \"crawl steps would go here\""
+      echo
+    fi
+    if [[ "$DO_PARAMS" -eq 1 ]]; then
+      echo "echo \"[params] (placeholder)\""
+      echo "echo \"param extraction steps would go here\""
+      echo
+    fi
+    if [[ "$DO_NUCLEI" -eq 1 ]]; then
+      echo "echo \"[nuclei] (placeholder)\""
+      echo "echo \"nuclei invocation would go here\""
+      echo
+    fi
+    if [[ "$DO_FFUF" -eq 1 ]]; then
+      echo "echo \"[ffuf] (placeholder)\""
+      echo "echo \"ffuf invocation would go here\""
+      echo
+    fi
+    if [[ "$DO_NMAP" -eq 1 ]]; then
+      echo "echo \"[nmap] (placeholder)\""
+      echo "echo \"nmap invocation would go here\""
+      echo
+    fi
+    if [[ "$DO_REPORT" -eq 1 ]]; then
+      echo "echo \"[report] (placeholder)\""
+      echo "echo \"report steps would go here\""
+      echo
+    fi
     echo "echo \"[done]\""
   } > "$cmds"
-
   chmod +x "$cmds"
 
   {
-    echo "# ZeroScope Run"
+    echo "# ZeroScope Report"
     echo
     echo "- Generated: $now"
-    echo "- Targets: $TARGETS_FILE"
-    echo "- Output: $RUN"
-    echo
-    echo "## Next steps"
-    echo "Run:"
-    echo
-    echo '```'
-    echo "./COMMANDS.sh"
-    echo '```'
+    echo "- Targets file: $TARGETS"
+    echo "- Selected: $(selected_summary)"
     echo
     echo "## Evidence"
-    echo "- httpx.json"
-    echo "- live_urls.txt"
-    echo "- urls_params_all.txt"
-    echo "- evidence/nuclei.jsonl"
-    echo "- evidence/nmap_top200.txt"
-    echo "- evidence/ffuf/*.json"
-  } > "$report"
+    echo "- out/run/evidence/"
+    echo
+    echo "## Notes"
+    echo "- Review COMMANDS.sh before running."
+  } > "$rep"
 
   {
-    echo "Generated at: $now"
-    echo "User acknowledged authorization phrase."
+    echo "Generated: $now"
+    echo "Authorization phrase accepted."
+    echo "Selected: $(selected_summary)"
     echo "Targets:"
-    cat "$TARGETS_FILE"
+    cat "$TARGETS"
   } > "$RUN/AUTHORIZATION.txt"
 
-  echo "${C_GREEN}[+]${C_RESET} Generated:"
-  echo "  ${C_CYAN}$cmds${C_RESET}"
-  echo "  ${C_CYAN}$report${C_RESET}"
+  printf "\n%s[+]%s Generated:\n" "$C_GREEN" "$C_RESET"
+  printf "  %s\n" "$cmds"
+  printf "  %s\n" "$rep"
   pause
 }
 
-doctor_page() {
-  banner
-  box_top
-  box_line "${C_BOLD}Doctor${C_RESET} (dependency check)"
-  box_line ""
-  box_bottom
-  echo
-  deps_status || true
-  pause
-}
-
-main_menu() {
-  init_run
+modules_menu(){
   while true; do
     banner
+    status_panel
     box_top
-    box_line "${C_BOLD}ZeroScope${C_RESET} (guided runbook generator)"
-    box_line ""
-    box_line "${C_YELLOW}1${C_RESET}) Targets"
-    box_line "${C_YELLOW}2${C_RESET}) Settings"
-    box_line "${C_YELLOW}3${C_RESET}) Doctor"
-    box_line "${C_YELLOW}4${C_RESET}) Generate Runbook (COMMANDS.sh)"
-    box_line "${C_YELLOW}q${C_RESET}) Quit"
-    box_bottom
+    box_ln "${C_BOLD}Modules${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Recon"
+    box_ln "${C_YELLOW}2${C_RESET}) URL Discovery"
+    box_ln "${C_YELLOW}3${C_RESET}) Crawl"
+    box_ln "${C_YELLOW}4${C_RESET}) Params"
+    box_ln "${C_YELLOW}5${C_RESET}) Scans"
+    box_ln "${C_YELLOW}6${C_RESET}) Report"
+    box_ln ""
+    box_ln "${C_YELLOW}c${C_RESET}) Clear selection"
+    box_ln "${C_YELLOW}g${C_RESET}) Generate runbook"
+    box_ln "${C_YELLOW}b${C_RESET}) Back"
+    box_bot
 
-    local count
-    count="$(wc -l < "$TARGETS_FILE" 2>/dev/null | tr -d ' ')"
-    echo "${C_DIM}Targets:${C_RESET} ${C_CYAN}${count}${C_RESET}   Out: ${C_CYAN}${OUT}${C_RESET}"
+    printf "\n%sSelected:%s %s\n" "$C_DIM" "$C_RESET" "$(selected_summary)"
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
+    IFS= read -r c || true
+    c="$(trim "$c")"
     case "$c" in
-      1) targets_page ;;
-      2) settings_page ;;
-      3) doctor_page ;;
-      4) generate_runbook ;;
+      1) page_recon ;;
+      2) page_urls ;;
+      3) page_crawl ;;
+      4) page_params ;;
+      5) page_scan ;;
+      6) page_report ;;
+      c|C) reset_modules; printf "\n%s[+]%s Cleared\n" "$C_GREEN" "$C_RESET"; pause ;;
+      g|G) generate_runbook ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+main_menu(){
+  init_run
+  reset_modules
+  while true; do
+    banner
+    status_panel
+    box_top
+    box_ln "${C_BOLD}ZeroScope${C_RESET}"
+    box_ln ""
+    box_ln "${C_YELLOW}1${C_RESET}) Targets"
+    box_ln "${C_YELLOW}2${C_RESET}) Modules"
+    box_ln "${C_YELLOW}3${C_RESET}) Settings"
+    box_ln "${C_YELLOW}4${C_RESET}) Doctor"
+    box_ln ""
+    box_ln "${C_YELLOW}q${C_RESET}) Quit"
+    box_bot
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c || true
+    c="$(trim "$c")"
+    case "$c" in
+      1) targets_menu ;;
+      2) modules_menu ;;
+      3) settings_menu ;;
+      4) doctor_menu ;;
       q|Q) exit 0 ;;
       *) ;;
     esac
