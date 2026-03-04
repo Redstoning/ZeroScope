@@ -16,7 +16,10 @@ trim(){ printf "%s" "$1" | sed 's/\r//g' | sed 's/^[[:space:]]\+//; s/[[:space:]
 lower(){ printf "%s" "$1" | tr 'A-Z' 'a-z'; }
 need(){ command -v "$1" >/dev/null 2>&1; }
 
-W=76
+W="$(tput cols 2>/dev/null || echo 80)"
+W=$((W-6))
+if (( W < 52 )); then W=52; fi
+if (( W > 96 )); then W=96; fi
 line(){ printf "%s" "$(printf '─%.0s' $(seq 1 "$W"))"; }
 box_top(){ printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(line)" "$C_RESET"; }
 box_bot(){ printf "%s└%s┘%s\n" "$C_MAGENTA" "$(line)" "$C_RESET"; }
@@ -44,36 +47,24 @@ OUT="out"
 RUN=""
 STATE=""
 DONE=""
+EVID=""
 TARGETS=""
+AUTH_PHRASE="I_HAVE_AUTHORIZATION"
+
 WORDLIST=""
 RATE="10"
 THREADS="50"
 DEPTH="3"
 NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
 SEVERITY="low,medium,high,critical"
-AUTH_PHRASE="I_HAVE_AUTHORIZATION"
-
-DO_RECON=0
-DO_URLS=0
-DO_CRAWL=0
-DO_PARAMS=0
-DO_RANK=0
-DO_REPORT=0
-DO_NUCLEI=0
-DO_FFUF=0
-DO_NMAP=0
-
-reset_modules(){
-  DO_RECON=0; DO_URLS=0; DO_CRAWL=0; DO_PARAMS=0; DO_RANK=0; DO_REPORT=0
-  DO_NUCLEI=0; DO_FFUF=0; DO_NMAP=0
-}
 
 init_run(){
   mkdir -p "$OUT/run"
   RUN="$OUT/run"
   STATE="$RUN/state"
   DONE="$STATE/done"
-  mkdir -p "$RUN/evidence" "$STATE" "$DONE"
+  EVID="$RUN/evidence"
+  mkdir -p "$STATE" "$DONE" "$EVID"
   TARGETS="$RUN/targets.txt"
   touch "$TARGETS"
 }
@@ -200,17 +191,19 @@ doctor_menu(){
   box_top
   box_ln "${C_BOLD}Doctor${C_RESET}"
   box_ln ""
-  box_ln "Checks for common dependencies."
+  box_ln "Dependency presence (optional)."
   box_ln ""
   box_bot
   echo
-  for c in rg jq subfinder dnsx httpx gau waybackurls katana nuclei ffuf nmap; do
+  for c in bash sed awk grep sort nl tput; do
     if need "$c"; then
       printf "%sOK%s   %s\n" "$C_GREEN" "$C_RESET" "$c"
     else
       printf "%sMISS%s %s\n" "$C_RED" "$C_RESET" "$c"
     fi
   done
+  echo
+  echo "${C_DIM}Your modules can require additional tools. Add checks inside module bodies.${C_RESET}"
   pause
 }
 
@@ -230,9 +223,7 @@ auth_gate(){
   box_top
   box_ln "${C_BOLD}Authorization Gate${C_RESET}"
   box_ln ""
-  box_ln "This will generate a runbook for the targets you entered."
-  box_ln "Type the phrase exactly to continue:"
-  box_ln ""
+  box_ln "Type the phrase exactly to proceed:"
   box_ln "  ${C_CYAN}${AUTH_PHRASE}${C_RESET}"
   box_ln ""
   box_ln "${C_YELLOW}b${C_RESET}) Back"
@@ -244,133 +235,165 @@ auth_gate(){
   [[ "$a" == "$AUTH_PHRASE" ]]
 }
 
-module_header(){
-  banner
-  status_panel
-  box_top
-  box_ln "${C_BOLD}$1${C_RESET}"
-  box_ln ""
-  box_ln "$2"
-  box_ln ""
-  box_ln "${C_YELLOW}r${C_RESET}) Add to selection"
-  box_ln "${C_YELLOW}b${C_RESET}) Back"
-  box_bot
+mark_done(){ touch "$DONE/$1.done"; }
+is_done(){ [[ -f "$DONE/$1.done" ]]; }
+
+write_auth_log(){
+  local now
+  now="$(date -Is)"
+  {
+    echo "Generated: $now"
+    echo "Authorization phrase accepted."
+    echo "Targets:"
+    cat "$TARGETS"
+  } > "$RUN/AUTHORIZATION.txt"
 }
 
-page_recon(){
-  while true; do
-    module_header "Recon" "Module placeholder. Adds recon steps to runbook."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      r|R) DO_RECON=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+ensure_report(){
+  local rep="$RUN/REPORT.md"
+  if [[ ! -f "$rep" ]]; then
+    {
+      echo "# ZeroScope Report"
+      echo
+      echo "## Targets"
+      echo
+      if [[ -s "$TARGETS" ]]; then
+        while read -r t; do
+          [[ -z "$t" ]] && continue
+          echo "- $t"
+        done < "$TARGETS"
+      else
+        echo "- (none)"
+      fi
+      echo
+      echo "## Evidence Index"
+      echo
+      echo "- evidence/ (module outputs)"
+      echo
+      echo "## Hosts"
+      echo
+      if [[ -s "$TARGETS" ]]; then
+        while read -r t; do
+          [[ -z "$t" ]] && continue
+          echo "### $t"
+          echo
+          echo "- Evidence:"
+          echo "  - $(printf '%q\n' "evidence/$t/")"
+          echo
+        done < "$TARGETS"
+      fi
+    } > "$rep"
+  fi
 }
 
-page_urls(){
-  while true; do
-    module_header "URL Discovery" "Module placeholder. Adds URL discovery steps to runbook."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      r|R) DO_URLS=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+ensure_host_evidence_dirs(){
+  if [[ -s "$TARGETS" ]]; then
+    while read -r t; do
+      [[ -z "$t" ]] && continue
+      mkdir -p "$EVID/$t"
+    done < "$TARGETS"
+  fi
 }
 
-page_crawl(){
-  while true; do
-    module_header "Crawl" "Module placeholder. Adds crawling steps to runbook."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      r|R) DO_CRAWL=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+module_placeholder_run(){
+  local mod="$1"
+  local title="$2"
+  local outdir="$3"
+
+  mkdir -p "$outdir"
+  local now
+  now="$(date -Is)"
+  {
+    echo "Module: $mod"
+    echo "Title: $title"
+    echo "Time: $now"
+    echo
+    echo "This is a placeholder module."
+    echo "Fill in this module body inside zeroscope to run your authorized toolchain."
+  } > "$outdir/README.txt"
 }
 
-page_params(){
-  while true; do
-    module_header "Params" "Module placeholder. Adds param extraction steps to runbook."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      r|R) DO_PARAMS=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+run_module(){
+  local key="$1"
+  local title="$2"
+
+  if is_done "$key"; then
+    printf "%s[skip]%s %s (resume)\n" "$C_DIM" "$C_RESET" "$title"
+    return 0
+  fi
+
+  printf "%s[run]%s  %s\n" "$C_CYAN" "$C_RESET" "$title"
+  local outdir="$EVID/_$key"
+  case "$key" in
+    recon) module_placeholder_run "$key" "$title" "$outdir" ;;
+    urls) module_placeholder_run "$key" "$title" "$outdir" ;;
+    crawl) module_placeholder_run "$key" "$title" "$outdir" ;;
+    params) module_placeholder_run "$key" "$title" "$outdir" ;;
+    nuclei) module_placeholder_run "$key" "$title" "$outdir" ;;
+    ffuf) module_placeholder_run "$key" "$title" "$outdir" ;;
+    nmap) module_placeholder_run "$key" "$title" "$outdir" ;;
+    report)
+      ensure_report
+      module_placeholder_run "$key" "$title" "$outdir"
+      ;;
+    *) module_placeholder_run "$key" "$title" "$outdir" ;;
+  esac
+  mark_done "$key"
 }
 
-page_scan(){
-  while true; do
-    banner
-    status_panel
-    box_top
-    box_ln "${C_BOLD}Scans${C_RESET}"
-    box_ln ""
-    box_ln "${C_YELLOW}1${C_RESET}) Nuclei (placeholder)"
-    box_ln "${C_YELLOW}2${C_RESET}) ffuf (placeholder)"
-    box_ln "${C_YELLOW}3${C_RESET}) nmap (placeholder)"
-    box_ln ""
-    box_ln "${C_YELLOW}b${C_RESET}) Back"
-    box_bot
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      1) DO_NUCLEI=1; printf "%s[+]%s Added nuclei\n" "$C_GREEN" "$C_RESET"; pause ;;
-      2) DO_FFUF=1; printf "%s[+]%s Added ffuf\n" "$C_GREEN" "$C_RESET"; pause ;;
-      3) DO_NMAP=1; printf "%s[+]%s Added nmap\n" "$C_GREEN" "$C_RESET"; pause ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+reset_selection(){
+  SEL_recon=0
+  SEL_urls=0
+  SEL_crawl=0
+  SEL_params=0
+  SEL_nuclei=0
+  SEL_ffuf=0
+  SEL_nmap=0
+  SEL_report=0
 }
 
-page_report(){
-  while true; do
-    module_header "Report" "Adds ranking/report steps to runbook and creates REPORT.md."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c || true
-    c="$(trim "$c")"
-    case "$c" in
-      r|R) DO_RANK=1; DO_REPORT=1; printf "%s[+]%s Added\n" "$C_GREEN" "$C_RESET"; pause; return 0 ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
+toggle(){
+  local name="$1"
+  local v="${!name}"
+  if [[ "$v" -eq 1 ]]; then
+    printf -v "$name" "0"
+  else
+    printf -v "$name" "1"
+  fi
 }
 
-selected_summary(){
+sel_mark(){
+  local v="$1"
+  if [[ "$v" -eq 1 ]]; then
+    printf "%s[x]%s" "$C_GREEN" "$C_RESET"
+  else
+    printf "%s[ ]%s" "$C_DIM" "$C_RESET"
+  fi
+}
+
+sel_summary(){
   local s=""
-  [[ "$DO_RECON" -eq 1 ]] && s="$s recon"
-  [[ "$DO_URLS" -eq 1 ]] && s="$s urls"
-  [[ "$DO_CRAWL" -eq 1 ]] && s="$s crawl"
-  [[ "$DO_PARAMS" -eq 1 ]] && s="$s params"
-  [[ "$DO_NUCLEI" -eq 1 ]] && s="$s nuclei"
-  [[ "$DO_FFUF" -eq 1 ]] && s="$s ffuf"
-  [[ "$DO_NMAP" -eq 1 ]] && s="$s nmap"
-  [[ "$DO_REPORT" -eq 1 ]] && s="$s report"
+  [[ "$SEL_recon" -eq 1 ]] && s="$s recon"
+  [[ "$SEL_urls" -eq 1 ]] && s="$s urls"
+  [[ "$SEL_crawl" -eq 1 ]] && s="$s crawl"
+  [[ "$SEL_params" -eq 1 ]] && s="$s params"
+  [[ "$SEL_nuclei" -eq 1 ]] && s="$s nuclei"
+  [[ "$SEL_ffuf" -eq 1 ]] && s="$s ffuf"
+  [[ "$SEL_nmap" -eq 1 ]] && s="$s nmap"
+  [[ "$SEL_report" -eq 1 ]] && s="$s report"
   s="$(trim "$s")"
   [[ -z "$s" ]] && s="<none>"
   printf "%s" "$s"
 }
 
-generate_runbook(){
+run_selected(){
   if [[ "$(targets_count)" -eq 0 ]]; then
     printf "\n%s[!]%s Add targets first.\n" "$C_YELLOW" "$C_RESET"
+    pause
+    return 1
+  fi
+  if [[ "$(sel_summary)" == "<none>" ]]; then
+    printf "\n%s[!]%s Select at least one module.\n" "$C_YELLOW" "$C_RESET"
     pause
     return 1
   fi
@@ -378,98 +401,35 @@ generate_runbook(){
     return 0
   fi
 
-  local cmds="$RUN/COMMANDS.sh"
-  local rep="$RUN/REPORT.md"
-  local now
-  now="$(date -Is)"
+  mkdir -p "$EVID"
+  ensure_host_evidence_dirs
+  ensure_report
+  write_auth_log
 
-  {
-    echo "#!/usr/bin/env bash"
-    echo "set -euo pipefail"
-    echo "OUTDIR=\"$RUN\""
-    echo "TARGETS=\"$TARGETS\""
-    echo "RATE=\"$RATE\""
-    echo "THREADS=\"$THREADS\""
-    echo "DEPTH=\"$DEPTH\""
-    echo "WORDLIST=\"$WORDLIST\""
-    echo "NUCLEI_TAGS=\"$NUCLEI_TAGS\""
-    echo "SEVERITY=\"$SEVERITY\""
-    echo "mkdir -p \"\$OUTDIR/evidence\""
-    echo "echo \"[runbook] generated: $now\""
-    echo "echo \"[runbook] targets: \$TARGETS\""
-    echo
-    echo "echo \"[NOTE] This runbook is generated from UI selections.\""
-    echo "echo \"[NOTE] Review commands before running.\""
-    echo
-    if [[ "$DO_RECON" -eq 1 ]]; then
-      echo "echo \"[recon] (placeholder)\""
-      echo "echo \"recon steps would go here\""
-      echo
-    fi
-    if [[ "$DO_URLS" -eq 1 ]]; then
-      echo "echo \"[urls] (placeholder)\""
-      echo "echo \"url discovery steps would go here\""
-      echo
-    fi
-    if [[ "$DO_CRAWL" -eq 1 ]]; then
-      echo "echo \"[crawl] (placeholder)\""
-      echo "echo \"crawl steps would go here\""
-      echo
-    fi
-    if [[ "$DO_PARAMS" -eq 1 ]]; then
-      echo "echo \"[params] (placeholder)\""
-      echo "echo \"param extraction steps would go here\""
-      echo
-    fi
-    if [[ "$DO_NUCLEI" -eq 1 ]]; then
-      echo "echo \"[nuclei] (placeholder)\""
-      echo "echo \"nuclei invocation would go here\""
-      echo
-    fi
-    if [[ "$DO_FFUF" -eq 1 ]]; then
-      echo "echo \"[ffuf] (placeholder)\""
-      echo "echo \"ffuf invocation would go here\""
-      echo
-    fi
-    if [[ "$DO_NMAP" -eq 1 ]]; then
-      echo "echo \"[nmap] (placeholder)\""
-      echo "echo \"nmap invocation would go here\""
-      echo
-    fi
-    if [[ "$DO_REPORT" -eq 1 ]]; then
-      echo "echo \"[report] (placeholder)\""
-      echo "echo \"report steps would go here\""
-      echo
-    fi
-    echo "echo \"[done]\""
-  } > "$cmds"
-  chmod +x "$cmds"
+  banner
+  status_panel
+  box_top
+  box_ln "${C_BOLD}Running Selected Modules${C_RESET}"
+  box_ln ""
+  box_ln "Resume is ON. Completed modules will be skipped."
+  box_ln "Selected: $(sel_summary)"
+  box_ln ""
+  box_bot
+  echo
 
-  {
-    echo "# ZeroScope Report"
-    echo
-    echo "- Generated: $now"
-    echo "- Targets file: $TARGETS"
-    echo "- Selected: $(selected_summary)"
-    echo
-    echo "## Evidence"
-    echo "- out/run/evidence/"
-    echo
-    echo "## Notes"
-    echo "- Review COMMANDS.sh before running."
-  } > "$rep"
+  [[ "$SEL_recon" -eq 1 ]] && run_module "recon" "Recon (placeholder)"
+  [[ "$SEL_urls" -eq 1 ]] && run_module "urls" "URL Discovery (placeholder)"
+  [[ "$SEL_crawl" -eq 1 ]] && run_module "crawl" "Crawl (placeholder)"
+  [[ "$SEL_params" -eq 1 ]] && run_module "params" "Params (placeholder)"
+  [[ "$SEL_nuclei" -eq 1 ]] && run_module "nuclei" "Nuclei (placeholder)"
+  [[ "$SEL_ffuf" -eq 1 ]] && run_module "ffuf" "ffuf (placeholder)"
+  [[ "$SEL_nmap" -eq 1 ]] && run_module "nmap" "nmap (placeholder)"
+  [[ "$SEL_report" -eq 1 ]] && run_module "report" "Report (placeholder)"
 
-  {
-    echo "Generated: $now"
-    echo "Authorization phrase accepted."
-    echo "Selected: $(selected_summary)"
-    echo "Targets:"
-    cat "$TARGETS"
-  } > "$RUN/AUTHORIZATION.txt"
-
-  printf "\n%s[+]%s Generated:\n" "$C_GREEN" "$C_RESET"
-  printf "  %s\n" "$cmds"
-  printf "  %s\n" "$rep"
+  echo
+  printf "%s[+]%s Done.\n" "$C_GREEN" "$C_RESET"
+  printf "%sReport:%s %s\n" "$C_DIM" "$C_RESET" "$RUN/REPORT.md"
+  printf "%sEvidence:%s %s\n" "$C_DIM" "$C_RESET" "$RUN/evidence/"
   pause
 }
 
@@ -480,31 +440,37 @@ modules_menu(){
     box_top
     box_ln "${C_BOLD}Modules${C_RESET}"
     box_ln ""
-    box_ln "${C_YELLOW}1${C_RESET}) Recon"
-    box_ln "${C_YELLOW}2${C_RESET}) URL Discovery"
-    box_ln "${C_YELLOW}3${C_RESET}) Crawl"
-    box_ln "${C_YELLOW}4${C_RESET}) Params"
-    box_ln "${C_YELLOW}5${C_RESET}) Scans"
-    box_ln "${C_YELLOW}6${C_RESET}) Report"
+    box_ln "1) $(sel_mark "$SEL_recon") Recon"
+    box_ln "2) $(sel_mark "$SEL_urls") URL Discovery"
+    box_ln "3) $(sel_mark "$SEL_crawl") Crawl"
+    box_ln "4) $(sel_mark "$SEL_params") Params"
+    box_ln "5) $(sel_mark "$SEL_nuclei") Nuclei"
+    box_ln "6) $(sel_mark "$SEL_ffuf") ffuf"
+    box_ln "7) $(sel_mark "$SEL_nmap") nmap"
+    box_ln "8) $(sel_mark "$SEL_report") Report"
     box_ln ""
+    box_ln "${C_YELLOW}r${C_RESET}) Run selected"
     box_ln "${C_YELLOW}c${C_RESET}) Clear selection"
-    box_ln "${C_YELLOW}g${C_RESET}) Generate runbook"
+    box_ln "${C_YELLOW}x${C_RESET}) Reset resume state"
     box_ln "${C_YELLOW}b${C_RESET}) Back"
     box_bot
 
-    printf "\n%sSelected:%s %s\n" "$C_DIM" "$C_RESET" "$(selected_summary)"
+    printf "\n%sSelected:%s %s\n" "$C_DIM" "$C_RESET" "$(sel_summary)"
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
     IFS= read -r c || true
     c="$(trim "$c")"
     case "$c" in
-      1) page_recon ;;
-      2) page_urls ;;
-      3) page_crawl ;;
-      4) page_params ;;
-      5) page_scan ;;
-      6) page_report ;;
-      c|C) reset_modules; printf "\n%s[+]%s Cleared\n" "$C_GREEN" "$C_RESET"; pause ;;
-      g|G) generate_runbook ;;
+      1) toggle SEL_recon ;;
+      2) toggle SEL_urls ;;
+      3) toggle SEL_crawl ;;
+      4) toggle SEL_params ;;
+      5) toggle SEL_nuclei ;;
+      6) toggle SEL_ffuf ;;
+      7) toggle SEL_nmap ;;
+      8) toggle SEL_report ;;
+      r|R) run_selected ;;
+      c|C) reset_selection ;;
+      x|X) rm -f "$DONE/"*.done 2>/dev/null || true; printf "\n%s[+]%s Resume state reset.\n" "$C_GREEN" "$C_RESET"; pause ;;
       b|B) return 0 ;;
       *) ;;
     esac
@@ -513,7 +479,7 @@ modules_menu(){
 
 main_menu(){
   init_run
-  reset_modules
+  reset_selection
   while true; do
     banner
     status_panel
