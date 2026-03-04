@@ -22,31 +22,18 @@ fi
 
 cls() { printf "\033c"; }
 pause() { printf "\n%sPress Enter to continue...%s" "$C_DIM" "$C_RESET"; IFS= read -r _; }
-hr() { printf "%s\n" "────────────────────────────────────────────────────────────────"; }
-
-center() {
-  local s="$1" w="${2:-80}"
-  local len="${#s}"
-  if (( len >= w )); then echo "$s"; return; fi
-  local pad=$(( (w - len) / 2 ))
-  printf "%*s%s\n" "$pad" "" "$s"
-}
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; return 1; }; }
 
 prompt_default() {
-  local label="$1"
-  local def="$2"
-  local var=""
+  local label="$1" def="$2" var=""
   printf "%s%s%s [%s]: " "$C_BOLD" "$label" "$C_RESET" "$def"
   IFS= read -r var
   if [[ -z "$var" ]]; then echo "$def"; else echo "$var"; fi
 }
 
 prompt_yesno() {
-  local label="$1"
-  local def="$2"
-  local var=""
+  local label="$1" def="$2" var=""
   printf "%s%s%s (y/n) [%s]: " "$C_BOLD" "$label" "$C_RESET" "$def"
   IFS= read -r var
   if [[ -z "$var" ]]; then var="$def"; fi
@@ -59,9 +46,8 @@ prompt_yesno() {
 
 banner() {
   cls
-  echo
-  echo "${C_MAGENTA}${C_BOLD}"
-  cat <<'EOF'
+  cat << "EOF"
+
  ______                 _____                      
 |___  /                /  ___|                     
    / /  ___ _ __ ___   \ `--.  ___ ___  _ __   ___ 
@@ -70,15 +56,19 @@ banner() {
 \_____/\___|_|  \___/  \____/ \___\___/| .__/ \___|
                                        | |         
                                        |_|         
+
+                  Hack The Planet
+
 EOF
-  echo "${C_RESET}"
-  center "${C_DIM}Hack The Planet${C_RESET}" 70
-  echo
 }
 
 box_top()    { printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 66))" "$C_RESET"; }
 box_bottom() { printf "%s└%s┘%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 66))" "$C_RESET"; }
 box_line()   { printf "%s│%s %-66s %s│%s\n" "$C_MAGENTA" "$C_RESET" "$1" "$C_MAGENTA" "$C_RESET"; }
+
+is_single_number() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
 
 # -------------------------
 # Defaults / state
@@ -94,18 +84,21 @@ WORDLIST="./wordlists/discovery.txt"
 NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
 SEVERITY="low,medium,high,critical"
 
+RUN=""
+DONE=""
+
 # module toggles for a run
-DO_SUBFINDER=1
-DO_DNSX=1
-DO_HTTPX=1
-DO_URLS=1
-DO_KATANA=1
-DO_PARAMS=1
-DO_NMAP=1
-DO_FFUF=1
-DO_NUCLEI=1
-DO_RANK=1
-DO_REPORT=1
+DO_SUBFINDER=0
+DO_DNSX=0
+DO_HTTPX=0
+DO_URLS=0
+DO_KATANA=0
+DO_PARAMS=0
+DO_NMAP=0
+DO_FFUF=0
+DO_NUCLEI=0
+DO_RANK=0
+DO_REPORT=0
 
 reset_modules() {
   DO_SUBFINDER=0; DO_DNSX=0; DO_HTTPX=0; DO_URLS=0; DO_KATANA=0; DO_PARAMS=0
@@ -118,7 +111,7 @@ apply_preset_full() {
 }
 
 # -------------------------
-# Core logic (guardrails + steps)
+# Core helpers / guardrails
 # -------------------------
 append_unique() {
   local src="$1" dst="$2"
@@ -197,6 +190,9 @@ init_run_dirs() {
   normalize_scope_file
 }
 
+# -------------------------
+# Steps (authorized recon/triage only)
+# -------------------------
 step_subfinder() {
   subfinder -silent -dL "$RUN/scope.normalized.txt" -all -o "$RUN/subs_raw.txt" || true
   cat "$RUN/scope.normalized.txt" "$RUN/subs_raw.txt" 2>/dev/null | sed '/^$/d' | sort -u > "$RUN/targets_raw.txt"
@@ -297,6 +293,7 @@ step_rank() {
     : > "$RUN/ranked.tsv"
     return 0
   fi
+
   jq -r '
     select(.host!=null) |
     [
@@ -350,6 +347,10 @@ step_report() {
       echo "| Score | Host | URL | Status | Title |"
       echo "|---:|---|---|---:|---|"
       head -n 50 "$RUN/ranked.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" | "$5" |"}'
+    else
+      echo "## Notes"
+      echo
+      echo "No ranking data yet. Run recon/httpx first."
     fi
     echo
   } > "$report"
@@ -371,14 +372,13 @@ validate_before_run() {
   [[ "$DO_FFUF" -eq 1 ]] && need ffuf || true
   [[ "$DO_NMAP" -eq 1 ]] && need nmap || true
 
+  [[ -z "$OUT" ]] && return 1
   return 0
 }
 
 run_pipeline() {
   init_run_dirs
-  hr
   echo "${C_DIM}Output:${C_RESET} $RUN"
-  hr
   [[ "$DO_SUBFINDER" -eq 1 ]] && run_step "01_subfinder" step_subfinder
   [[ "$DO_DNSX" -eq 1 ]] && run_step "02_dnsx" step_dnsx
   [[ "$DO_HTTPX" -eq 1 ]] && run_step "03_httpx" step_httpx
@@ -390,14 +390,12 @@ run_pipeline() {
   [[ "$DO_NUCLEI" -eq 1 ]] && run_step "09_nuclei" step_nuclei
   [[ "$DO_RANK" -eq 1 ]] && run_step "10_rank" step_rank
   [[ "$DO_REPORT" -eq 1 ]] && run_step "11_report" step_report
-  hr
   echo "${C_GREEN}[+]${C_RESET} Done"
   echo "${C_DIM}Report:${C_RESET} $RUN/REPORT.md"
-  hr
 }
 
 # -------------------------
-# TUI Menu
+# TUI blocks
 # -------------------------
 print_status() {
   box_top
@@ -466,9 +464,195 @@ settings_menu() {
   done
 }
 
-select_modules() {
-  reset_modules
+confirm_and_run() {
+  ACK="I_HAVE_AUTHORIZATION"
+  if ! validate_before_run; then
+    echo "${C_RED}[!]${C_RESET} Fix dependencies/config first."
+    pause
+    return 1
+  fi
+  echo
+  echo "${C_DIM}Scope file:${C_RESET} $SCOPE"
+  echo "${C_DIM}Output dir:${C_RESET} $OUT"
+  echo
+  printf "%sProceed? (y/n) > %s" "$C_BOLD" "$C_RESET"
+  IFS= read -r ok
+  if [[ "$(echo "$ok" | tr 'A-Z' 'a-z')" != "y" ]]; then
+    return 0
+  fi
+  run_pipeline
+  pause
+}
+
+module_header() {
+  banner
+  print_status
+  box_top
+  box_line "${C_BOLD}$1${C_RESET}"
+  box_line ""
+  box_line "$2"
+  box_line ""
+  box_line "${C_YELLOW}r${C_RESET}) Run this module"
+  box_line "${C_YELLOW}b${C_RESET}) Back"
+  box_bottom
+}
+
+page_full() {
+  while true; do
+    module_header "Full Recon" "Runs subfinder, dnsx, httpx, urls, crawl, params, nmap, ffuf, nuclei, rank, report."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        apply_preset_full
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_recon() {
+  while true; do
+    module_header "Recon Only" "Runs subfinder + dnsx + httpx (+ rank/report)."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_SUBFINDER=1; DO_DNSX=1; DO_HTTPX=1; DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_urls() {
+  while true; do
+    module_header "URLs Only" "Runs gau + waybackurls (+ params + rank/report)."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_URLS=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_crawl() {
+  while true; do
+    module_header "Crawl Only" "Runs katana (+ params + rank/report). Requires live_urls.txt from httpx."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_KATANA=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_params() {
+  while true; do
+    module_header "Params Build" "Builds urls_params_all.txt from gathered URLs (+ rank/report)."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_nuclei() {
+  while true; do
+    module_header "Nuclei Only" "Runs nuclei against live_urls.txt. Requires httpx to have run."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_NUCLEI=1; DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_ffuf() {
+  while true; do
+    module_header "ffuf Only" "Runs ffuf content discovery against live_urls.txt. Requires httpx to have run."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_FFUF=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_nmap() {
+  while true; do
+    module_header "Nmap Only" "Runs nmap top-ports scan for live_hosts.txt. Requires httpx/dnsx."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_NMAP=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+page_rank_report() {
+  while true; do
+    module_header "Rank + Report" "Ranks httpx results and writes REPORT.md."
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      r|R)
+        reset_modules
+        DO_RANK=1; DO_REPORT=1
+        confirm_and_run
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+apply_selection_buffer() {
   local sel="$1"
+  reset_modules
   for n in $sel; do
     case "$n" in
       1) apply_preset_full ;;
@@ -486,54 +670,66 @@ select_modules() {
   DO_REPORT=1
 }
 
+open_page_for_number() {
+  case "$1" in
+    1) page_full ;;
+    2) page_recon ;;
+    3) page_urls ;;
+    4) page_crawl ;;
+    5) page_params ;;
+    6) page_nuclei ;;
+    7) page_ffuf ;;
+    8) page_nmap ;;
+    9) page_rank_report ;;
+    *) ;;
+  esac
+}
+
+# -------------------------
+# Main loop
+# -------------------------
 main_menu() {
   local selected=""
   while true; do
     banner
     print_status
     print_menu
+
     if [[ -n "$selected" ]]; then
       echo "${C_DIM}Selected:${C_RESET} $selected"
     fi
+
     printf "\n%sChoose modules (e.g. 2 3 6), or s/r/q > %s" "$C_BOLD" "$C_RESET"
     IFS= read -r input
+    input="$(echo "$input" | tr -s ' ' | sed 's/^ //; s/ $//')"
 
     case "$input" in
       q|Q) exit 0 ;;
       s|S) settings_menu ;;
       r|R)
         if [[ -z "$selected" ]]; then
-          echo "${C_YELLOW}[!]${C_RESET} No modules selected."
+          echo "${C_YELLOW}[!]${C_RESET} No selection buffer. Type numbers (e.g. 2 3 6) first."
           pause
           continue
         fi
-        ACK="I_HAVE_AUTHORIZATION"
-        select_modules "$selected"
-        if ! validate_before_run; then
-          echo "${C_RED}[!]${C_RESET} Fix dependencies/config first."
-          pause
-          continue
-        fi
-        echo
-        echo "${C_DIM}This will run ONLY on scope in:${C_RESET} $SCOPE"
-        echo "${C_DIM}Output dir:${C_RESET} $OUT"
-        echo
-        printf "%sProceed? (y/n) > %s" "$C_BOLD" "$C_RESET"
-        IFS= read -r ok
-        if [[ "$(echo "$ok" | tr 'A-Z' 'a-z')" != "y" ]]; then
-          continue
-        fi
-        run_pipeline
-        pause
+        apply_selection_buffer "$selected"
+        confirm_and_run
+        ;;
+      "")
+        continue
         ;;
       *)
-        selected="$(echo "$input" | tr -s ' ')"
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+          open_page_for_number "$input"
+        else
+          selected="$input"
+        fi
         ;;
     esac
   done
 }
 
-# -------------------------
-# Start
-# -------------------------
+need rg >/dev/null 2>&1 || true
+need jq >/dev/null 2>&1 || true
+
 main_menu
