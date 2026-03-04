@@ -1,48 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------
-# UI (tput) + helpers
-# -------------------------
 if command -v tput >/dev/null 2>&1; then
-  C_RESET="$(tput sgr0)"
-  C_BOLD="$(tput bold)"
-  C_DIM="$(tput dim)"
-  C_RED="$(tput setaf 1)"
-  C_GREEN="$(tput setaf 2)"
-  C_YELLOW="$(tput setaf 3)"
-  C_BLUE="$(tput setaf 4)"
-  C_MAGENTA="$(tput setaf 5)"
-  C_CYAN="$(tput setaf 6)"
-  C_WHITE="$(tput setaf 7)"
+  C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
+  C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
+  C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"
 else
   C_RESET=""; C_BOLD=""; C_DIM=""
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
 fi
 
 cls() { printf "\033c"; }
 pause() { printf "\n%sPress Enter to continue...%s" "$C_DIM" "$C_RESET"; IFS= read -r _; }
+need() { command -v "$1" >/dev/null 2>&1 || return 1; }
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; return 1; }; }
-
-prompt_default() {
-  local label="$1" def="$2" var=""
-  printf "%s%s%s [%s]: " "$C_BOLD" "$label" "$C_RESET" "$def"
-  IFS= read -r var
-  if [[ -z "$var" ]]; then echo "$def"; else echo "$var"; fi
-}
-
-prompt_yesno() {
-  local label="$1" def="$2" var=""
-  printf "%s%s%s (y/n) [%s]: " "$C_BOLD" "$label" "$C_RESET" "$def"
-  IFS= read -r var
-  if [[ -z "$var" ]]; then var="$def"; fi
-  case "$(echo "$var" | tr 'A-Z' 'a-z')" in
-    y|yes) echo "1" ;;
-    n|no) echo "0" ;;
-    *) [[ "$def" =~ ^(y|Y) ]] && echo "1" || echo "0" ;;
-  esac
-}
+box_top()    { printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 70))" "$C_RESET"; }
+box_bottom() { printf "%s└%s┘%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 70))" "$C_RESET"; }
+box_line()   { printf "%s│%s %-70s %s│%s\n" "$C_MAGENTA" "$C_RESET" "$1" "$C_MAGENTA" "$C_RESET"; }
 
 banner() {
   cls
@@ -62,674 +36,308 @@ banner() {
 EOF
 }
 
-box_top()    { printf "%s┌%s┐%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 66))" "$C_RESET"; }
-box_bottom() { printf "%s└%s┘%s\n" "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 66))" "$C_RESET"; }
-box_line()   { printf "%s│%s %-66s %s│%s\n" "$C_MAGENTA" "$C_RESET" "$1" "$C_MAGENTA" "$C_RESET"; }
-
-is_single_number() {
-  [[ "$1" =~ ^[0-9]+$ ]]
-}
-
-# -------------------------
-# Defaults / state
-# -------------------------
-SCOPE="scope.txt"
-OUT="out"
-ACK="I_HAVE_AUTHORIZATION"
-RESUME=1
-CONCURRENCY="50"
-RATE="10"
-DEPTH="3"
-WORDLIST="./wordlists/discovery.txt"
-NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
-SEVERITY="low,medium,high,critical"
-
-RUN=""
-DONE=""
-
-# module toggles for a run
-DO_SUBFINDER=0
-DO_DNSX=0
-DO_HTTPX=0
-DO_URLS=0
-DO_KATANA=0
-DO_PARAMS=0
-DO_NMAP=0
-DO_FFUF=0
-DO_NUCLEI=0
-DO_RANK=0
-DO_REPORT=0
-
-reset_modules() {
-  DO_SUBFINDER=0; DO_DNSX=0; DO_HTTPX=0; DO_URLS=0; DO_KATANA=0; DO_PARAMS=0
-  DO_NMAP=0; DO_FFUF=0; DO_NUCLEI=0; DO_RANK=0; DO_REPORT=0
-}
-
-apply_preset_full() {
-  DO_SUBFINDER=1; DO_DNSX=1; DO_HTTPX=1; DO_URLS=1; DO_KATANA=1; DO_PARAMS=1
-  DO_NMAP=1; DO_FFUF=1; DO_NUCLEI=1; DO_RANK=1; DO_REPORT=1
-}
-
-# -------------------------
-# Core helpers / guardrails
-# -------------------------
-append_unique() {
-  local src="$1" dst="$2"
-  [[ ! -f "$src" ]] && return 0
-  sed '/^$/d' "$src" | sort -u > "${src}.u"
-  cat "$dst" "${src}.u" 2>/dev/null | sed '/^$/d' | sort -u > "${dst}.new"
-  mv "${dst}.new" "$dst"
-  rm -f "${src}.u"
-}
-
-safe_url_host() {
-  echo "$1" | sed 's#^https\?://##g' | sed 's#/.*$##g' | tr '/:?' '___'
-}
-
-step_done() { [[ -f "$1" ]]; }
-mark_done() { touch "$1"; }
-
-run_step() {
-  local name="$1" donefile="$DONE/$name"
-  shift
-  if [[ "$RESUME" -eq 1 ]] && step_done "$donefile"; then
-    echo "${C_CYAN}[*]${C_RESET} Skipping (resume): $name"
-    return 0
-  fi
-  echo "${C_BLUE}[*]${C_RESET} Running: $name"
-  "$@"
-  mark_done "$donefile"
-}
-
-normalize_scope_file() {
-  cat "$SCOPE" \
+normalize_target() {
+  echo "$1" \
     | sed 's/\r//g' \
     | sed 's#^https\?://##g' \
     | sed 's#/.*$##g' \
     | sed 's/[[:space:]]//g' \
-    | sed '/^$/d' \
-    | sed '/^#/d' \
-    | tr 'A-Z' 'a-z' \
-    | sort -u > "$RUN/scope.normalized.txt"
+    | tr 'A-Z' 'a-z'
 }
 
-is_in_scope_host() {
-  local h="$1"
-  [[ -z "$h" ]] && return 1
-  h="$(echo "$h" | tr 'A-Z' 'a-z')"
-  if rg -qx "$h" "$RUN/scope.normalized.txt"; then return 0; fi
-  while read -r root; do
-    [[ -z "$root" ]] && continue
-    if [[ "$h" == *".${root}" ]]; then return 0; fi
-  done < "$RUN/scope.normalized.txt"
-  return 1
-}
+OUT="out"
+RUN=""
+TARGETS_FILE=""
+WORDLIST=""
+RATE="10"
+CONCURRENCY="50"
+DEPTH="3"
+NUCLEI_TAGS="misconfig,cves,default-logins,exposed-panels,takeovers"
+SEVERITY="low,medium,high,critical"
 
-filter_in_scope_hosts() {
-  while read -r h; do
-    [[ -z "$h" ]] && continue
-    if is_in_scope_host "$h"; then echo "$h"; fi
-  done
-}
-
-filter_in_scope_urls() {
-  while read -r u; do
-    [[ -z "$u" ]] && continue
-    local h
-    h="$(echo "$u" | sed 's#^https\?://##g' | sed 's#/.*$##g')"
-    if is_in_scope_host "$h"; then echo "$u"; fi
-  done
-}
-
-init_run_dirs() {
-  mkdir -p "$OUT"
+init_run() {
+  mkdir -p "$OUT/run"
   RUN="$OUT/run"
-  mkdir -p "$RUN/evidence" "$RUN/state" "$RUN/state/done"
-  DONE="$RUN/state/done"
-  touch "$RUN/state/seen_hosts.txt" "$RUN/state/seen_urls.txt" "$RUN/state/seen_params.txt"
-  normalize_scope_file
+  TARGETS_FILE="$RUN/targets.txt"
+  : > "$TARGETS_FILE"
+  mkdir -p "$RUN/evidence"
 }
 
-# -------------------------
-# Steps (authorized recon/triage only)
-# -------------------------
-step_subfinder() {
-  subfinder -silent -dL "$RUN/scope.normalized.txt" -all -o "$RUN/subs_raw.txt" || true
-  cat "$RUN/scope.normalized.txt" "$RUN/subs_raw.txt" 2>/dev/null | sed '/^$/d' | sort -u > "$RUN/targets_raw.txt"
-  cat "$RUN/targets_raw.txt" | filter_in_scope_hosts > "$RUN/targets.txt"
-}
-
-step_dnsx() {
-  [[ -f "$RUN/targets.txt" ]] || cp -f "$RUN/scope.normalized.txt" "$RUN/targets.txt"
-  dnsx -silent -l "$RUN/targets.txt" -a -aaaa -resp -o "$RUN/resolved.txt" || true
-  cut -d' ' -f1 "$RUN/resolved.txt" | sed '/^$/d' | sort -u | filter_in_scope_hosts > "$RUN/resolved_hosts.txt"
-  append_unique "$RUN/resolved_hosts.txt" "$RUN/state/seen_hosts.txt"
-  cp -f "$RUN/state/seen_hosts.txt" "$RUN/hosts_all.txt"
-}
-
-step_httpx() {
-  [[ -f "$RUN/hosts_all.txt" ]] || cp -f "$RUN/state/seen_hosts.txt" "$RUN/hosts_all.txt"
-  httpx -silent -l "$RUN/hosts_all.txt" -title -tech-detect -status-code -content-length -server -location \
-    -threads "$CONCURRENCY" -rate-limit "$RATE" -json -o "$RUN/httpx.json" || true
-
-  jq -r 'select(.url!=null) | .url' "$RUN/httpx.json" 2>/dev/null | sed '/^$/d' | sort -u > "$RUN/live_urls_raw.txt"
-  cat "$RUN/live_urls_raw.txt" | filter_in_scope_urls | sort -u > "$RUN/live_urls.txt"
-
-  jq -r 'select(.host!=null) | .host' "$RUN/httpx.json" 2>/dev/null | sed '/^$/d' | sort -u | filter_in_scope_hosts > "$RUN/live_hosts.txt"
-
-  append_unique "$RUN/live_urls.txt" "$RUN/state/seen_urls.txt"
-}
-
-step_urls() {
-  [[ -f "$RUN/live_hosts.txt" ]] || cp -f "$RUN/state/seen_hosts.txt" "$RUN/live_hosts.txt"
-
-  cat "$RUN/live_hosts.txt" | gau --subs --blacklist png,jpg,jpeg,gif,svg,css,woff,woff2,eot,ttf,ico,mp4,mp3,pdf,zip,tar,gz,7z 2>/dev/null \
-    | sed '/^$/d' | sort -u > "$RUN/gau_urls.txt" || true
-
-  cat "$RUN/live_hosts.txt" | waybackurls 2>/dev/null | sed '/^$/d' | sort -u > "$RUN/wayback_urls.txt" || true
-
-  cat "$RUN/gau_urls.txt" "$RUN/wayback_urls.txt" 2>/dev/null | sed '/^$/d' | sort -u > "$RUN/urls_hist_raw.txt" || true
-  cat "$RUN/urls_hist_raw.txt" | filter_in_scope_urls | sort -u > "$RUN/urls_hist.txt"
-
-  append_unique "$RUN/urls_hist.txt" "$RUN/state/seen_urls.txt"
-}
-
-step_katana() {
-  if [[ ! -s "$RUN/live_urls.txt" ]]; then
-    echo "${C_YELLOW}[!]${C_RESET} No live_urls.txt to crawl. Run httpx first."
-    return 0
-  fi
-  katana -silent -list "$RUN/live_urls.txt" -depth "$DEPTH" -jc -jsl -kf -c "$CONCURRENCY" -rl "$RATE" \
-    -o "$RUN/katana_urls_raw.txt" || true
-  cat "$RUN/katana_urls_raw.txt" | filter_in_scope_urls | sed '/^$/d' | sort -u > "$RUN/katana_urls.txt"
-  append_unique "$RUN/katana_urls.txt" "$RUN/state/seen_urls.txt"
-}
-
-step_params() {
-  cp -f "$RUN/state/seen_urls.txt" "$RUN/urls_merged.txt"
-  rg -n '\?' "$RUN/urls_merged.txt" | cut -d: -f2- | sed '/^$/d' | sort -u > "$RUN/urls_params_new.txt" || true
-  append_unique "$RUN/urls_params_new.txt" "$RUN/state/seen_params.txt"
-  cp -f "$RUN/state/seen_params.txt" "$RUN/urls_params_all.txt"
-}
-
-step_nmap() {
-  [[ -f "$RUN/live_hosts.txt" ]] || cp -f "$RUN/state/seen_hosts.txt" "$RUN/live_hosts.txt"
-  if [[ ! -s "$RUN/live_hosts.txt" ]]; then
-    echo "${C_YELLOW}[!]${C_RESET} No live_hosts.txt for nmap. Run httpx/dnsx first."
-    return 0
-  fi
-  nmap -sV -sC -T4 --top-ports 200 -iL "$RUN/live_hosts.txt" -oN "$RUN/evidence/nmap_top200.txt" || true
-}
-
-step_ffuf() {
-  if [[ ! -f "$WORDLIST" ]]; then
-    echo "${C_RED}[!]${C_RESET} Wordlist not found: $WORDLIST"
-    return 1
-  fi
-  if [[ ! -s "$RUN/live_urls.txt" ]]; then
-    echo "${C_YELLOW}[!]${C_RESET} No live_urls.txt for ffuf. Run httpx first."
-    return 0
-  fi
-  mkdir -p "$RUN/evidence/ffuf"
-  while read -r u; do
-    [[ -z "$u" ]] && continue
-    hs="$(safe_url_host "$u")"
-    ffuf -w "$WORDLIST" -u "$u/FUZZ" -t 30 -rate "$RATE" -timeout 8 \
-      -mc 200,204,301,302,307,308,401,403,405 -of json -o "$RUN/evidence/ffuf/${hs}.json" >/dev/null 2>&1 || true
-  done < "$RUN/live_urls.txt"
-}
-
-step_nuclei() {
-  if [[ ! -s "$RUN/live_urls.txt" ]]; then
-    echo "${C_YELLOW}[!]${C_RESET} No live_urls.txt for nuclei. Run httpx first."
-    return 0
-  fi
-  nuclei -silent -l "$RUN/live_urls.txt" -tags "$NUCLEI_TAGS" -severity "$SEVERITY" \
-    -rl "$RATE" -c "$CONCURRENCY" -jsonl -o "$RUN/evidence/nuclei.jsonl" || true
-}
-
-step_rank() {
-  if [[ ! -f "$RUN/httpx.json" ]]; then
-    : > "$RUN/ranked.tsv"
-    return 0
-  fi
-
-  jq -r '
-    select(.host!=null) |
-    [
-      .host,
-      (.url // ""),
-      (.status_code // 0),
-      (.title // "" | gsub("\t";" ") | .[0:120]),
-      ((.tech // []) | join(",")),
-      ((.webserver // .server // "") | tostring)
-    ] | @tsv
-  ' "$RUN/httpx.json" 2>/dev/null \
-  | awk -F'\t' '
-    function sc(status, tech, server, s, tl) {
-      s=0
-      if (status==200 || status==204) s+=3
-      if (status==401 || status==403) s+=5
-      if (status>=500 && status<600) s+=8
-      if (server!="") s+=2
-      if (tech!="") s+=2
-      tl=tolower(tech)
-      if (tl ~ /(graphql|kibana|jenkins|gitlab|jira|confluence|harbor|vault|traefik|kong)/) s+=8
-      return s
-    }
-    {
-      host=$1; url=$2; status=$3+0; title=$4; tech=$5; server=$6
-      score=sc(status,tech,server)
-      print score "\t" host "\t" url "\t" status "\t" title "\t" tech "\t" server
-    }
-  ' | sort -rn -k1,1 > "$RUN/ranked.tsv"
-}
-
-step_report() {
-  local report="$RUN/REPORT.md"
-  {
-    echo "# ZeroScope Report"
-    echo
-    echo "- Generated: $(date -Is)"
-    echo "- Output: run/"
-    echo
-    echo "## Key Files"
-    echo "- scope.normalized.txt"
-    [[ -f "$RUN/live_urls.txt" ]] && echo "- live_urls.txt"
-    [[ -f "$RUN/live_hosts.txt" ]] && echo "- live_hosts.txt"
-    [[ -f "$RUN/urls_params_all.txt" ]] && echo "- urls_params_all.txt"
-    [[ -f "$RUN/ranked.tsv" ]] && echo "- ranked.tsv"
-    echo "- evidence/"
-    echo
-    if [[ -s "$RUN/ranked.tsv" ]]; then
-      echo "## Top Targets"
-      echo
-      echo "| Score | Host | URL | Status | Title |"
-      echo "|---:|---|---|---:|---|"
-      head -n 50 "$RUN/ranked.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" | "$5" |"}'
+deps_status() {
+  local missing=0
+  for c in rg jq subfinder dnsx httpx gau waybackurls katana nuclei ffuf nmap; do
+    if need "$c"; then
+      printf "%sOK%s  %s\n" "$C_GREEN" "$C_RESET" "$c"
     else
-      echo "## Notes"
-      echo
-      echo "No ranking data yet. Run recon/httpx first."
+      printf "%sMISS%s %s\n" "$C_RED" "$C_RESET" "$c"
+      missing=1
     fi
-    echo
-  } > "$report"
+  done
+  return "$missing"
 }
 
-validate_before_run() {
-  [[ -f "$SCOPE" ]] || { echo "${C_RED}[!]${C_RESET} Scope file not found: $SCOPE"; return 1; }
-  [[ "$ACK" == "I_HAVE_AUTHORIZATION" ]] || { echo "${C_RED}[!]${C_RESET} Refusing to run without ACK"; return 1; }
-
-  need rg || return 1
-  need jq || return 1
-
-  [[ "$DO_SUBFINDER" -eq 1 ]] && need subfinder || true
-  [[ "$DO_DNSX" -eq 1 ]] && need dnsx || true
-  [[ "$DO_HTTPX" -eq 1 ]] && need httpx || true
-  [[ "$DO_URLS" -eq 1 ]] && { need gau || return 1; need waybackurls || return 1; }
-  [[ "$DO_KATANA" -eq 1 ]] && need katana || true
-  [[ "$DO_NUCLEI" -eq 1 ]] && need nuclei || true
-  [[ "$DO_FFUF" -eq 1 ]] && need ffuf || true
-  [[ "$DO_NMAP" -eq 1 ]] && need nmap || true
-
-  [[ -z "$OUT" ]] && return 1
-  return 0
-}
-
-run_pipeline() {
-  init_run_dirs
-  echo "${C_DIM}Output:${C_RESET} $RUN"
-  [[ "$DO_SUBFINDER" -eq 1 ]] && run_step "01_subfinder" step_subfinder
-  [[ "$DO_DNSX" -eq 1 ]] && run_step "02_dnsx" step_dnsx
-  [[ "$DO_HTTPX" -eq 1 ]] && run_step "03_httpx" step_httpx
-  [[ "$DO_URLS" -eq 1 ]] && run_step "04_urls" step_urls
-  [[ "$DO_KATANA" -eq 1 ]] && run_step "05_katana" step_katana
-  [[ "$DO_PARAMS" -eq 1 ]] && run_step "06_params" step_params
-  [[ "$DO_NMAP" -eq 1 ]] && run_step "07_nmap" step_nmap
-  [[ "$DO_FFUF" -eq 1 ]] && run_step "08_ffuf" step_ffuf
-  [[ "$DO_NUCLEI" -eq 1 ]] && run_step "09_nuclei" step_nuclei
-  [[ "$DO_RANK" -eq 1 ]] && run_step "10_rank" step_rank
-  [[ "$DO_REPORT" -eq 1 ]] && run_step "11_report" step_report
-  echo "${C_GREEN}[+]${C_RESET} Done"
-  echo "${C_DIM}Report:${C_RESET} $RUN/REPORT.md"
-}
-
-# -------------------------
-# TUI blocks
-# -------------------------
-print_status() {
-  box_top
-  box_line "${C_BOLD}Config${C_RESET}"
-  box_line "Scope: ${C_CYAN}${SCOPE}${C_RESET}"
-  box_line "Out:   ${C_CYAN}${OUT}${C_RESET}"
-  box_line "Resume: ${C_CYAN}${RESUME}${C_RESET}   Rate: ${C_CYAN}${RATE}${C_RESET}   Threads: ${C_CYAN}${CONCURRENCY}${C_RESET}   Depth: ${C_CYAN}${DEPTH}${C_RESET}"
-  box_line "Wordlist: ${C_CYAN}${WORDLIST}${C_RESET}"
-  box_bottom
-}
-
-print_menu() {
-  box_top
-  box_line "${C_BOLD}Select modules (combine with spaces)${C_RESET}"
-  box_line ""
-  box_line "${C_GREEN}1${C_RESET}) Full Recon (recommended)"
-  box_line "${C_GREEN}2${C_RESET}) Recon Only (subfinder + dnsx + httpx)"
-  box_line "${C_GREEN}3${C_RESET}) URLs Only (gau + wayback)"
-  box_line "${C_GREEN}4${C_RESET}) Crawl Only (katana)"
-  box_line "${C_GREEN}5${C_RESET}) Params Build"
-  box_line "${C_GREEN}6${C_RESET}) Nuclei Only"
-  box_line "${C_GREEN}7${C_RESET}) ffuf Only"
-  box_line "${C_GREEN}8${C_RESET}) Nmap Only"
-  box_line "${C_GREEN}9${C_RESET}) Rank + Report Only"
-  box_line ""
-  box_line "${C_YELLOW}s${C_RESET}) Settings"
-  box_line "${C_YELLOW}r${C_RESET}) Run selected modules"
-  box_line "${C_YELLOW}q${C_RESET}) Quit"
-  box_bottom
-}
-
-settings_menu() {
+targets_page() {
   while true; do
     banner
-    print_status
+    box_top
+    box_line "${C_BOLD}Targets${C_RESET} (no files to edit)"
+    box_line ""
+    box_line "Paste domains/hosts one per line. Blank line to finish."
+    box_line "Examples: example.com  api.example.com"
+    box_line ""
+    box_line "${C_YELLOW}1${C_RESET}) Enter targets now"
+    box_line "${C_YELLOW}2${C_RESET}) View current targets"
+    box_line "${C_YELLOW}3${C_RESET}) Clear targets"
+    box_line "${C_YELLOW}b${C_RESET}) Back"
+    box_bottom
+
+    local count
+    count="$(wc -l < "$TARGETS_FILE" 2>/dev/null | tr -d ' ')"
+    echo "${C_DIM}Current targets:${C_RESET} ${C_CYAN}${count}${C_RESET}   (${C_DIM}$TARGETS_FILE${C_RESET})"
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+
+    case "$c" in
+      1)
+        echo
+        echo "${C_DIM}Paste targets now. Blank line to stop.${C_RESET}"
+        while true; do
+          printf "> "
+          IFS= read -r line || true
+          line="$(normalize_target "$line")"
+          [[ -z "$line" ]] && break
+          echo "$line" >> "$TARGETS_FILE"
+        done
+        sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
+        ;;
+      2)
+        echo
+        if [[ -s "$TARGETS_FILE" ]]; then
+          nl -ba "$TARGETS_FILE"
+        else
+          echo "No targets yet."
+        fi
+        pause
+        ;;
+      3)
+        : > "$TARGETS_FILE"
+        ;;
+      b|B) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+settings_page() {
+  while true; do
+    banner
     box_top
     box_line "${C_BOLD}Settings${C_RESET}"
     box_line ""
-    box_line "${C_GREEN}1${C_RESET}) Scope file"
-    box_line "${C_GREEN}2${C_RESET}) Output directory"
-    box_line "${C_GREEN}3${C_RESET}) Resume mode"
-    box_line "${C_GREEN}4${C_RESET}) Rate limit"
-    box_line "${C_GREEN}5${C_RESET}) Concurrency"
-    box_line "${C_GREEN}6${C_RESET}) Crawl depth"
-    box_line "${C_GREEN}7${C_RESET}) Wordlist path"
-    box_line "${C_GREEN}8${C_RESET}) Nuclei tags"
-    box_line "${C_GREEN}9${C_RESET}) Nuclei severity"
+    box_line "Output: ${C_CYAN}${OUT}${C_RESET}"
+    box_line "Rate: ${C_CYAN}${RATE}${C_RESET}   Concurrency: ${C_CYAN}${CONCURRENCY}${C_RESET}   Depth: ${C_CYAN}${DEPTH}${C_RESET}"
+    box_line "Wordlist: ${C_CYAN}${WORDLIST:-<not set>}${C_RESET}"
+    box_line "Nuclei tags: ${C_CYAN}${NUCLEI_TAGS}${C_RESET}"
+    box_line "Severity: ${C_CYAN}${SEVERITY}${C_RESET}"
     box_line ""
+    box_line "${C_YELLOW}1${C_RESET}) Output directory"
+    box_line "${C_YELLOW}2${C_RESET}) Rate limit"
+    box_line "${C_YELLOW}3${C_RESET}) Concurrency"
+    box_line "${C_YELLOW}4${C_RESET}) Crawl depth"
+    box_line "${C_YELLOW}5${C_RESET}) Wordlist path"
+    box_line "${C_YELLOW}6${C_RESET}) Nuclei tags"
+    box_line "${C_YELLOW}7${C_RESET}) Nuclei severity"
     box_line "${C_YELLOW}b${C_RESET}) Back"
     box_bottom
     printf "\n%s> %s" "$C_BOLD" "$C_RESET"
     IFS= read -r c
     case "$c" in
-      1) SCOPE="$(prompt_default "Scope file" "$SCOPE")" ;;
-      2) OUT="$(prompt_default "Output directory" "$OUT")" ;;
-      3) RESUME="$(prompt_yesno "Resume mode" "$( [[ "$RESUME" -eq 1 ]] && echo y || echo n )")" ;;
-      4) RATE="$(prompt_default "Rate limit (req/sec)" "$RATE")" ;;
-      5) CONCURRENCY="$(prompt_default "Concurrency" "$CONCURRENCY")" ;;
-      6) DEPTH="$(prompt_default "Crawl depth" "$DEPTH")" ;;
-      7) WORDLIST="$(prompt_default "Wordlist path" "$WORDLIST")" ;;
-      8) NUCLEI_TAGS="$(prompt_default "Nuclei tags" "$NUCLEI_TAGS")" ;;
-      9) SEVERITY="$(prompt_default "Nuclei severity" "$SEVERITY")" ;;
+      1) printf "Out [%s]: " "$OUT"; IFS= read -r v; [[ -n "$v" ]] && OUT="$v"; init_run ;;
+      2) printf "Rate [%s]: " "$RATE"; IFS= read -r v; [[ -n "$v" ]] && RATE="$v" ;;
+      3) printf "Concurrency [%s]: " "$CONCURRENCY"; IFS= read -r v; [[ -n "$v" ]] && CONCURRENCY="$v" ;;
+      4) printf "Depth [%s]: " "$DEPTH"; IFS= read -r v; [[ -n "$v" ]] && DEPTH="$v" ;;
+      5) printf "Wordlist path (blank = unset): "; IFS= read -r v; WORDLIST="$v" ;;
+      6) printf "Nuclei tags [%s]: " "$NUCLEI_TAGS"; IFS= read -r v; [[ -n "$v" ]] && NUCLEI_TAGS="$v" ;;
+      7) printf "Severity [%s]: " "$SEVERITY"; IFS= read -r v; [[ -n "$v" ]] && SEVERITY="$v" ;;
       b|B) return 0 ;;
       *) ;;
     esac
   done
 }
 
-confirm_and_run() {
-  ACK="I_HAVE_AUTHORIZATION"
-  if ! validate_before_run; then
-    echo "${C_RED}[!]${C_RESET} Fix dependencies/config first."
+generate_runbook() {
+  if [[ ! -s "$TARGETS_FILE" ]]; then
+    echo "${C_RED}[!]${C_RESET} No targets set."
     pause
     return 1
   fi
+
+  banner
+  box_top
+  box_line "${C_BOLD}Authorization gate${C_RESET}"
+  box_line ""
+  box_line "This generates a runbook for the targets you entered."
+  box_line "Only proceed if you have explicit authorization."
+  box_line ""
+  box_bottom
   echo
-  echo "${C_DIM}Scope file:${C_RESET} $SCOPE"
-  echo "${C_DIM}Output dir:${C_RESET} $OUT"
-  echo
-  printf "%sProceed? (y/n) > %s" "$C_BOLD" "$C_RESET"
-  IFS= read -r ok
-  if [[ "$(echo "$ok" | tr 'A-Z' 'a-z')" != "y" ]]; then
-    return 0
+  printf "%sType: I_HAVE_AUTHORIZATION > %s" "$C_BOLD" "$C_RESET"
+  IFS= read -r ack
+  if [[ "$ack" != "I_HAVE_AUTHORIZATION" ]]; then
+    echo "${C_YELLOW}[!]${C_RESET} Cancelled."
+    pause
+    return 1
   fi
-  run_pipeline
+
+  local cmds="$RUN/COMMANDS.sh"
+  local report="$RUN/REPORT.md"
+  local now
+  now="$(date -Is)"
+
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo
+    echo "OUTDIR=\"$RUN\""
+    echo "TARGETS=\"$TARGETS_FILE\""
+    echo "RATE=\"$RATE\""
+    echo "CONCURRENCY=\"$CONCURRENCY\""
+    echo "DEPTH=\"$DEPTH\""
+    echo "NUCLEI_TAGS=\"$NUCLEI_TAGS\""
+    echo "SEVERITY=\"$SEVERITY\""
+    echo "WORDLIST=\"${WORDLIST}\""
+    echo
+    echo "mkdir -p \"\$OUTDIR/evidence\""
+    echo
+    echo "echo \"[runbook] targets: \$TARGETS\""
+    echo "echo \"[runbook] output:  \$OUTDIR\""
+    echo
+    echo "echo \"[1] subdomains (subfinder)\""
+    echo "subfinder -silent -dL \"\$TARGETS\" -all -o \"\$OUTDIR/subs.txt\" || true"
+    echo
+    echo "echo \"[2] resolve (dnsx)\""
+    echo "cat \"\$TARGETS\" \"\$OUTDIR/subs.txt\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/hosts.txt\""
+    echo "dnsx -silent -l \"\$OUTDIR/hosts.txt\" -a -aaaa -resp -o \"\$OUTDIR/resolved.txt\" || true"
+    echo "cut -d' ' -f1 \"\$OUTDIR/resolved.txt\" | sed '/^$/d' | sort -u > \"\$OUTDIR/resolved_hosts.txt\""
+    echo
+    echo "echo \"[3] probe (httpx)\""
+    echo "httpx -silent -l \"\$OUTDIR/resolved_hosts.txt\" -title -tech-detect -status-code -content-length -server -location \\"
+    echo "  -threads \"\$CONCURRENCY\" -rate-limit \"\$RATE\" -json -o \"\$OUTDIR/httpx.json\" || true"
+    echo "jq -r 'select(.url!=null) | .url' \"\$OUTDIR/httpx.json\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/live_urls.txt\""
+    echo "jq -r 'select(.host!=null) | .host' \"\$OUTDIR/httpx.json\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/live_hosts.txt\""
+    echo
+    echo "echo \"[4] urls (gau + waybackurls)\""
+    echo "cat \"\$OUTDIR/live_hosts.txt\" | gau --subs 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/gau_urls.txt\" || true"
+    echo "cat \"\$OUTDIR/live_hosts.txt\" | waybackurls 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/wayback_urls.txt\" || true"
+    echo "cat \"\$OUTDIR/gau_urls.txt\" \"\$OUTDIR/wayback_urls.txt\" 2>/dev/null | sed '/^$/d' | sort -u > \"\$OUTDIR/urls_merged.txt\" || true"
+    echo
+    echo "echo \"[5] crawl (katana)\""
+    echo "katana -silent -list \"\$OUTDIR/live_urls.txt\" -depth \"\$DEPTH\" -jc -jsl -kf -c \"\$CONCURRENCY\" -rl \"\$RATE\" \\"
+    echo "  -o \"\$OUTDIR/katana_urls.txt\" || true"
+    echo
+    echo "echo \"[6] params\""
+    echo "rg -n '\\?' \"\$OUTDIR/urls_merged.txt\" \"\$OUTDIR/katana_urls.txt\" 2>/dev/null | cut -d: -f2- | sed '/^$/d' | sort -u > \"\$OUTDIR/urls_params_all.txt\" || true"
+    echo
+    echo "echo \"[7] nuclei (optional)\""
+    echo "nuclei -silent -l \"\$OUTDIR/live_urls.txt\" -tags \"\$NUCLEI_TAGS\" -severity \"\$SEVERITY\" -rl \"\$RATE\" -c \"\$CONCURRENCY\" \\"
+    echo "  -jsonl -o \"\$OUTDIR/evidence/nuclei.jsonl\" || true"
+    echo
+    echo "echo \"[8] nmap (optional)\""
+    echo "nmap -sV -sC -T4 --top-ports 200 -iL \"\$OUTDIR/live_hosts.txt\" -oN \"\$OUTDIR/evidence/nmap_top200.txt\" || true"
+    echo
+    echo "echo \"[9] ffuf (optional)\""
+    echo "if [[ -n \"\$WORDLIST\" && -f \"\$WORDLIST\" ]]; then"
+    echo "  mkdir -p \"\$OUTDIR/evidence/ffuf\""
+    echo "  while read -r u; do"
+    echo "    [[ -z \"\$u\" ]] && continue"
+    echo "    hs=\$(echo \"\$u\" | sed 's#^https\\?://##g' | sed 's#/.*\$##g' | tr '/:?' '___')"
+    echo "    ffuf -w \"\$WORDLIST\" -u \"\$u/FUZZ\" -t 30 -rate \"\$RATE\" -timeout 8 \\"
+    echo "      -mc 200,204,301,302,307,308,401,403,405 -of json -o \"\$OUTDIR/evidence/ffuf/\${hs}.json\" >/dev/null 2>&1 || true"
+    echo "  done < \"\$OUTDIR/live_urls.txt\""
+    echo "else"
+    echo "  echo \"[ffuf] wordlist not set; skipping\""
+    echo "fi"
+    echo
+    echo "echo \"[done]\""
+  } > "$cmds"
+
+  chmod +x "$cmds"
+
+  {
+    echo "# ZeroScope Run"
+    echo
+    echo "- Generated: $now"
+    echo "- Targets: $TARGETS_FILE"
+    echo "- Output: $RUN"
+    echo
+    echo "## Next steps"
+    echo "Run:"
+    echo
+    echo '```'
+    echo "./COMMANDS.sh"
+    echo '```'
+    echo
+    echo "## Evidence"
+    echo "- httpx.json"
+    echo "- live_urls.txt"
+    echo "- urls_params_all.txt"
+    echo "- evidence/nuclei.jsonl"
+    echo "- evidence/nmap_top200.txt"
+    echo "- evidence/ffuf/*.json"
+  } > "$report"
+
+  {
+    echo "Generated at: $now"
+    echo "User acknowledged authorization phrase."
+    echo "Targets:"
+    cat "$TARGETS_FILE"
+  } > "$RUN/AUTHORIZATION.txt"
+
+  echo "${C_GREEN}[+]${C_RESET} Generated:"
+  echo "  ${C_CYAN}$cmds${C_RESET}"
+  echo "  ${C_CYAN}$report${C_RESET}"
   pause
 }
 
-module_header() {
+doctor_page() {
   banner
-  print_status
   box_top
-  box_line "${C_BOLD}$1${C_RESET}"
+  box_line "${C_BOLD}Doctor${C_RESET} (dependency check)"
   box_line ""
-  box_line "$2"
-  box_line ""
-  box_line "${C_YELLOW}r${C_RESET}) Run this module"
-  box_line "${C_YELLOW}b${C_RESET}) Back"
   box_bottom
+  echo
+  deps_status || true
+  pause
 }
 
-page_full() {
-  while true; do
-    module_header "Full Recon" "Runs subfinder, dnsx, httpx, urls, crawl, params, nmap, ffuf, nuclei, rank, report."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        apply_preset_full
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_recon() {
-  while true; do
-    module_header "Recon Only" "Runs subfinder + dnsx + httpx (+ rank/report)."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_SUBFINDER=1; DO_DNSX=1; DO_HTTPX=1; DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_urls() {
-  while true; do
-    module_header "URLs Only" "Runs gau + waybackurls (+ params + rank/report)."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_URLS=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_crawl() {
-  while true; do
-    module_header "Crawl Only" "Runs katana (+ params + rank/report). Requires live_urls.txt from httpx."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_KATANA=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_params() {
-  while true; do
-    module_header "Params Build" "Builds urls_params_all.txt from gathered URLs (+ rank/report)."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_PARAMS=1; DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_nuclei() {
-  while true; do
-    module_header "Nuclei Only" "Runs nuclei against live_urls.txt. Requires httpx to have run."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_NUCLEI=1; DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_ffuf() {
-  while true; do
-    module_header "ffuf Only" "Runs ffuf content discovery against live_urls.txt. Requires httpx to have run."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_FFUF=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_nmap() {
-  while true; do
-    module_header "Nmap Only" "Runs nmap top-ports scan for live_hosts.txt. Requires httpx/dnsx."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_NMAP=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-page_rank_report() {
-  while true; do
-    module_header "Rank + Report" "Ranks httpx results and writes REPORT.md."
-    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r c
-    case "$c" in
-      r|R)
-        reset_modules
-        DO_RANK=1; DO_REPORT=1
-        confirm_and_run
-        ;;
-      b|B) return 0 ;;
-      *) ;;
-    esac
-  done
-}
-
-apply_selection_buffer() {
-  local sel="$1"
-  reset_modules
-  for n in $sel; do
-    case "$n" in
-      1) apply_preset_full ;;
-      2) DO_SUBFINDER=1; DO_DNSX=1; DO_HTTPX=1; DO_RANK=1; DO_REPORT=1 ;;
-      3) DO_URLS=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1 ;;
-      4) DO_KATANA=1; DO_PARAMS=1; DO_RANK=1; DO_REPORT=1 ;;
-      5) DO_PARAMS=1; DO_RANK=1; DO_REPORT=1 ;;
-      6) DO_NUCLEI=1; DO_RANK=1; DO_REPORT=1 ;;
-      7) DO_FFUF=1; DO_REPORT=1 ;;
-      8) DO_NMAP=1; DO_REPORT=1 ;;
-      9) DO_RANK=1; DO_REPORT=1 ;;
-      *) ;;
-    esac
-  done
-  DO_REPORT=1
-}
-
-open_page_for_number() {
-  case "$1" in
-    1) page_full ;;
-    2) page_recon ;;
-    3) page_urls ;;
-    4) page_crawl ;;
-    5) page_params ;;
-    6) page_nuclei ;;
-    7) page_ffuf ;;
-    8) page_nmap ;;
-    9) page_rank_report ;;
-    *) ;;
-  esac
-}
-
-# -------------------------
-# Main loop
-# -------------------------
 main_menu() {
-  local selected=""
+  init_run
   while true; do
     banner
-    print_status
-    print_menu
+    box_top
+    box_line "${C_BOLD}ZeroScope${C_RESET} (guided runbook generator)"
+    box_line ""
+    box_line "${C_YELLOW}1${C_RESET}) Targets"
+    box_line "${C_YELLOW}2${C_RESET}) Settings"
+    box_line "${C_YELLOW}3${C_RESET}) Doctor"
+    box_line "${C_YELLOW}4${C_RESET}) Generate Runbook (COMMANDS.sh)"
+    box_line "${C_YELLOW}q${C_RESET}) Quit"
+    box_bottom
 
-    if [[ -n "$selected" ]]; then
-      echo "${C_DIM}Selected:${C_RESET} $selected"
-    fi
-
-    printf "\n%sChoose modules (e.g. 2 3 6), or s/r/q > %s" "$C_BOLD" "$C_RESET"
-    IFS= read -r input
-    input="$(echo "$input" | tr -s ' ' | sed 's/^ //; s/ $//')"
-
-    case "$input" in
+    local count
+    count="$(wc -l < "$TARGETS_FILE" 2>/dev/null | tr -d ' ')"
+    echo "${C_DIM}Targets:${C_RESET} ${C_CYAN}${count}${C_RESET}   Out: ${C_CYAN}${OUT}${C_RESET}"
+    printf "\n%s> %s" "$C_BOLD" "$C_RESET"
+    IFS= read -r c
+    case "$c" in
+      1) targets_page ;;
+      2) settings_page ;;
+      3) doctor_page ;;
+      4) generate_runbook ;;
       q|Q) exit 0 ;;
-      s|S) settings_menu ;;
-      r|R)
-        if [[ -z "$selected" ]]; then
-          echo "${C_YELLOW}[!]${C_RESET} No selection buffer. Type numbers (e.g. 2 3 6) first."
-          pause
-          continue
-        fi
-        apply_selection_buffer "$selected"
-        confirm_and_run
-        ;;
-      "")
-        continue
-        ;;
-      *)
-        if [[ "$input" =~ ^[0-9]+$ ]]; then
-          open_page_for_number "$input"
-        else
-          selected="$input"
-        fi
-        ;;
+      *) ;;
     esac
   done
 }
-
-need rg >/dev/null 2>&1 || true
-need jq >/dev/null 2>&1 || true
 
 main_menu
